@@ -8,7 +8,7 @@ MuseScore-ready MusicXML out — fully automatic.
 
 ![Example output](examples/lift_me_up_page1.png)
 *First page of the transcription of "Lift Me Up" (original composition), generated
-entirely by the pipeline and rendered in MuseScore.*
+entirely by the pipeline and rendered in MuseScore.* 
 
 ## What it does
 
