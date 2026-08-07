@@ -1,4 +1,4 @@
-# [Project Name] — Audio to Piano Sheet Music
+# [PyScribe](https://github.com/Bomberman1359/PyScribe) — Audio to Piano Sheet Music
 
 Turn any song into playable, human-readable piano sheet music. Audio in,
 MuseScore-ready MusicXML out — fully automatic.
@@ -46,7 +46,7 @@ while the default run is byte-identical every time.
   actually read, so the pipeline prefers clean durations and stable octaves
   over transcribing every micro-fluctuation.
 
-## What didn't work (honestly)
+## What didn't work
 
 - **Loosened beat grids** made rhythm marginally different but cut real notes;
   after A/B testing across versions, the strict grid won.
@@ -62,7 +62,7 @@ Requires Python 3.11 and [ffmpeg](https://ffmpeg.org)
 (`brew install ffmpeg` on macOS).
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git clone https://github.com/Bomberman1359/PyScribe.git
 cd YOUR_REPO
 python3.11 -m venv piano_env
 source piano_env/bin/activate
@@ -116,5 +116,5 @@ transcriptions of other people's music is subject to the usual copyright rules.
 
 MIT — see [LICENSE](LICENSE).
 
-Built and iterated over [N] months as an independent project. Full development
+Built and iterated over a year as an independent project. Full development
 journal available on request.
