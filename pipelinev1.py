@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 # ============================================================================
-# pipeline.py  --  UNIFIED audio -> piano sheet music pipeline
+# pipelinev1.py  --  UNIFIED audio -> piano sheet music pipeline
 # ============================================================================
-# One command:   python pipeline.py "data/input/NEON.mp3"
+# One command:   python pipelinev1.py "data/input/<SONG_NAME>.mp3"
 #           (or) edit INPUT_AUDIO at the bottom and run   python pipeline.py
 #
 # Runs the whole chain, each stage writing its own file that the next reads.
@@ -20,17 +19,6 @@
 #   8. grand staff assembly        both mids  -> 7<song>_base.musicxml (+ .ver sidecar)
 #   9. bass-clef silence           base xml   -> 8<song>_silenced.musicxml
 #  10. accompaniment variation     silenced   -> FINAL_<song>.musicxml   (FINAL)
-#
-# The per-stage logic is copied VERBATIM from your locked scripts. The ONLY
-# differences vs the standalone files are:
-#   (a) every path is derived from the song name (no hardcoded "Lift Me Up"),
-#   (b) tempo is detected ONCE (madmom on accompaniment.wav) and threaded into
-#       BOTH the vocal-MID tempo stamp AND the chord extractor's beat grid -- so
-#       vocals and chords can never disagree on tempo. vocals_v8 used to hardcode
-#       128; that constant is now the detected tempo. On "Lift Me Up" the detected
-#       value is 128, so every stage is a no-op vs before.
-#   (c) CREPE runs fresh per song (cached to <song>_crepe.npz), instead of loading
-#       the Lift-Me-Up-only _crepe_cache_v6.npz.
 # ============================================================================
 
 # --- PYTHON 3.10+ & NUMPY 1.24+ COMPAT PATCH FOR MADMOM ---
@@ -117,14 +105,14 @@ GS_VERSION   = 11  # bumped whenever grand-staff cleanup logic changes; cached b
 MEL_VERSION  = 4   # bumped whenever the MELODY CHAIN (stages 5-7: patch/extend/
                    # fill) changes order or logic; a cached patched MID from an
                    # older chain is stale and stages 5-7 rebuild automatically.
-                   # (Added after a chain REORDER silently reused old-order files.)
+                   
 
 # --- bass silence + accompaniment variation ---
 SIL_FLOOR_FRAC = 0.15
 SIL_GATE_BEATS = 2.0
 ACC_SMOOTH_SEC = 3.0
 
-# --- treble register + chromatic-blip cleanup (Miracles findings) ---
+# --- treble register + chromatic-blip cleanup  ---
 TREBLE_LOW_MEDIAN = 55   # G3: a phrase must CENTER below this to be lifted.
                          # This phrase rule is the ONLY thing that ever moves the
                          # melody; hand collisions move the BASS down instead
@@ -137,7 +125,7 @@ BASS_DROP_FLOOR   = 24   # C1: a colliding bass chord drops by octaves, but neve
 CHROMA_BLIP_MAX   = 2    # an off-key half-step blip must be an 8th or shorter
 CHD_FIX_MAX_BEATS = 2.0  # diatonic chord guard only touches blocks this short
 
-# --- instrumental rest fill (Goal C; DP engine inlined below, from other_transcriber v5) ---
+# --- instrumental rest fill ---
 ENABLE_REST_FILL = True   # False = grand staff consumes the extended vocals directly
 VGAP_GATE_BEATS = 2.0   # a hole this long in the VOCAL line gets patched from vocals.wav
 VPATCH_CONF     = 0.50  # CREPE-confidence floor: beats averaging below this are 'wobble'
