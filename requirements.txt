@@ -1,0 +1,24 @@
+# Core numerics -- madmom and older MIR code expect numpy 1.x APIs
+numpy<2.0
+scipy
+
+# Audio / MIR
+librosa
+soundfile
+pretty_midi
+music21
+
+# Models
+torch
+torchcrepe
+demucs
+basic-pitch
+
+# Beat tracking. If this fails to build (common on Python 3.11), run:
+#   pip install cython "numpy<2.0"
+#   pip install git+https://github.com/CPJKU/madmom
+# (pipeline.py already contains the runtime collections/np.float compat patch)
+madmom
+
+# Web demo only (app.py) -- safe to leave installed either way
+gradio

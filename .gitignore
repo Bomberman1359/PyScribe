@@ -180,5 +180,27 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# environment
+piano_env/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+
+# audio -- never commit copyrighted songs or their stems
 *.mp3
 *.wav
+*.flac
+*.m4a
+*.ogg
+data/input/
+separated/
+
+# pipeline caches and intermediates
+output/
+*.npz
+*.mid
+*.ver
+
+# allow the curated demo (your own composition only)
+!examples/**
