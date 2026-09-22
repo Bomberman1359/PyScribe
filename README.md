@@ -17,7 +17,7 @@ The melody comes from the vocal stem, the chords come from the bass and backing 
 |---|---|
 | 0 | Demucs (`htdemucs`) splits the song into vocals, bass, drums, and other |
 | 1 | The three non-vocal stems are mixed into `accompaniment.wav` for beat tracking |
-| 2 | madmom tracks the beats. If one steady pulse explains them, the grid is rebuilt from it, which puts back beats madmom dropped in quiet parts |
+| 2 | madmom finds the beats, but it misses some in quiet parts. If the beats it did find fit one steady tempo, every beat is redrawn at that tempo, which fills the missing ones back in |
 | 3-4 | CREPE (full model) tracks the vocal pitch every 10 ms, and the contour is split into notes at pitch changes and dips in vocal energy |
 | 5 | Basic Pitch runs on the vocal stem to recover notes CREPE missed or scrambled, but only where someone is actually singing |
 | 6 | Notes the singer was still holding get extended through fake rests |
@@ -33,17 +33,17 @@ Without a seed you get the same sheet every time. A seed nudges the melody timin
 
 ## Design decisions
 
-- **Fix problems on the page when possible.** Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the notes themselves, so they don't care which stage caused the problem. They held up better than trying to catch every case in the audio.
-- **Measure the recording instead of guessing.** Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
+- **Fix problems on the page when possible.** Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the written notes, so one rule catches the same mistake no matter where it came from. Stopping each mistake earlier, in the audio, meant chasing a new edge case every time.
+- **Let the recording decide.** Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
 - **No tuning for one song.** Every rule had to work across different songs, not just Lift Me Up.
 - **A rough fill is better than an empty bar.** If there's a melody in a vocal rest, it goes on the page even if it isn't perfect.
 
 ## What didn't work
 
-- **Loosening the beat grid.** I tried a looser grid in version 11. It still cut real notes and barely changed the rhythm, so I rolled back to the strict grid from version 8.
-- **Telling vibrato apart from real ornaments.** Heuristics can't do this reliably. Some vibrato still slips through as short notes, and fixing that would take a trained model.
+- **Using the beat grid to clean up vibrato.** Vibrato shows up as extra short notes, so I tried a rule where a pitch change only counted as a new note if it landed close to a beat. Set tight, it deleted real notes. Loosened, it barely did anything, because sixteenth-note subdivisions sit so close together that almost any wobble lands near one by luck. I took the rule back out.
+- **Telling vibrato apart from real ornaments.** After the grid I tried two more rules for the same problem, and they all failed the same way: a vibrato wobble and a real ornament both go up a step and come back, so any rule that deletes one deletes the other. Some vibrato still slips through as short notes, and fixing that would take a trained model.
 - **Stale caches.** Old cached files kept getting reused after I changed the logic, so a fix wouldn't show up and I couldn't tell why. Now the cached score, melody, and beat grid each carry a version number, and a mismatch forces a rebuild.
-- **Patching dropped beats one at a time.** madmom dropped 19 beats on Lift Me Up, mostly in quiet passages, and the score came out 5 measures short (111 instead of 116). My first fix compared each gap to the gaps around it, but the dropouts were bunched together, so it only found 4 of them. Rebuilding the whole grid from one steady pulse fixed it.
+- **Finding missed beats one gap at a time.** madmom missed 19 beats on Lift Me Up, mostly in quiet parts, so the score came out 5 measures short (111 instead of 116). My first fix checked the space between every pair of beats, and if one space was about twice as long as the ones next to it, it added a beat in the middle. But the missed beats were bunched together, so the spaces next to them were stretched too and nothing stood out. It only caught 4 of the 19. What worked was finding the one steady tempo that fits the whole song and redrawing every beat from that.
 - **Pulling the melody out of a loud mix.** Melodia and Basic Pitch both lost the lead when it wasn't louder than the backing. On Lift Me Up the pitch confidence stayed near zero and the line slid down to the bass. So the instrumental line only fills vocal rests, and notes below C3 are kept out of it.
 
 ## Install
