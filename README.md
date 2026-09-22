@@ -1,120 +1,120 @@
-# [PyScribe](https://github.com/Bomberman1359/PyScribe) — Audio to Piano Sheet Music
+# PyScribe
 
-Turn any song into playable, human-readable piano sheet music. Audio in,
-MuseScore-ready MusicXML out — fully automatic.
+PyScribe turns a song into piano sheet music you can actually play. You give it an mp3 or wav, and it gives back a two-hand piano arrangement as a MusicXML file that opens in MuseScore.
 
-**[▶ Try the live demo](https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE)** ·
-**[▶ Watch the demo video](YOUR_YOUTUBE_LINK)**
+**Live demo:** coming soon  
+**Demo video:** coming soon
 
-![Example output](examples/lift_me_up_page1.png)
-*First page of the transcription of "Lift Me Up" (original composition), generated
-entirely by the pipeline and rendered in MuseScore.* 
+![First page of the Lift Me Up transcription in MuseScore](examples/lift_me_up_page1.png)
 
-## What it does
+*First page of the sheet PyScribe made for "Lift Me Up", a song I wrote. Nothing was fixed by hand. The full score is in [`examples/`](examples) and was made with seed 2.*
 
-Given a full mix (mp3/wav), the pipeline produces a grand-staff piano
-arrangement: the vocal melody on the treble clef, and a chord-driven
-accompaniment on the bass clef that adapts its busyness to the energy of the
-actual recording.
+## How it works
 
-The pipeline runs in ten cached stages:
+The melody comes from the vocal stem, the chords come from the bass and backing stems, and both hands are lined up on one beat grid taken from the recording. The pipeline runs in 12 stages, numbered the same way they show up in the log:
 
-1. **Stem separation** — Demucs splits the mix into vocals / bass / drums / other
-2. **Accompaniment mixdown** — a beat-tracking reference track is built from the non-vocal stems
-3. **Pitch tracking** — torchcrepe extracts the vocal pitch contour (cached, so re-runs are instant)
-4. **Melody extraction** — the contour becomes note events: confidence gating, energy rescue, octave-outlier folding, half-step-trill collapse
-5. **Melody extension** — sustained syllables are held to their true sung length
-6. **Chord recognition** — chroma template matching over the bass + harmony stems, beat-aligned via madmom
-7. **Instrumental rest fill** — long vocal rests are filled with the lead instrumental line (BasicPitch)
-8. **Grand-staff assembly** — everything is quantized to a 16th-note grid, spelled correctly for the key, and written as MusicXML
-9. **Bass-clef silence detection** — the accompaniment rests where the actual recording rests, measured from stem energy
-10. **Accompaniment variation** — each section gets a texture (calm / medium / busy, five voicings each) chosen from the drum-onset energy of the recording
+| Stage | What happens |
+|---|---|
+| 0 | Demucs (`htdemucs`) splits the song into vocals, bass, drums, and other |
+| 1 | The three non-vocal stems are mixed into `accompaniment.wav` for beat tracking |
+| 2 | madmom tracks the beats. If one steady pulse explains them, the grid is rebuilt from it, which puts back beats madmom dropped in quiet parts |
+| 3-4 | CREPE (full model) tracks the vocal pitch every 10 ms, and the contour is split into notes at pitch changes and dips in vocal energy |
+| 5 | Basic Pitch runs on the vocal stem to recover notes CREPE missed or scrambled, but only where someone is actually singing |
+| 6 | Notes the singer was still holding get extended through fake rests |
+| 7 | Vocal rests a bar or longer get filled with a melody line pulled out of the instrumental stem |
+| 8 | Chroma templates pick a major or minor chord for each beat. A chord whose root matches the bass note gets a boost |
+| 9 | Everything is quantized to a sixteenth-note grid, cleaned up (octave errors, vibrato trills, split notes), spelled in the detected key, and written as MusicXML with music21 |
+| 10 | Left-hand chords turn into rests wherever the backing is silent |
+| 11 | Drum activity decides a calm, medium, or busy left-hand texture for each section |
 
-Every stage caches its output and version-gates it, so changing one stage
-rebuilds only what depends on it. An optional **seed** produces controlled
-variant sheets — different rhythm micro-decisions and accompaniment patterns —
-while the default run is byte-identical every time.
+Every stage saves its output in `output/<song>/`, so a rerun only redoes what changed. Cached files carry a version number (`GS_VERSION`, `MEL_VERSION`, `BEAT_REPAIR_VERSION`), and a mismatch forces a rebuild.
 
-## Design principles
+Without a seed you get the same sheet every time. A seed nudges the melody timing and picks different left-hand textures, so you can make a few versions and keep the one you like.
 
-- **Measure the audio, don't guess from symbols.** Accompaniment density,
-  bass-clef rests, and section boundaries are driven by actual signal energy
-  (STFT band energy, drum onset strength), not by symbolic heuristics.
-- **Each stage owns its domain.** No stage re-processes what an upstream stage
-  already decided.
-- **Playability over raw accuracy.** The goal is sheet music a pianist would
-  actually read, so the pipeline prefers clean durations and stable octaves
-  over transcribing every micro-fluctuation.
+## Design decisions
+
+- **Fix problems on the page when possible.** Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the notes themselves, so they don't care which stage caused the problem. They held up better than trying to catch every case in the audio.
+- **Measure the recording instead of guessing.** Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
+- **No tuning for one song.** Every rule had to work across different songs, not just Lift Me Up.
+- **A rough fill is better than an empty bar.** If there's a melody in a vocal rest, it goes on the page even if it isn't perfect.
 
 ## What didn't work
 
-- **Loosened beat grids** made rhythm marginally different but cut real notes;
-  after A/B testing across versions, the strict grid won.
-- **Vibrato vs. ornament** cannot be reliably separated with heuristics — a
-  trained model would be needed. Residual imperfections here are accepted.
-- **Stale cached intermediates** silently poisoned early results until every
-  cached sheet gained a version sidecar that forces rebuilds when the cleanup
-  logic changes.
+- **Loosening the beat grid.** I tried a looser grid in version 11. It still cut real notes and barely changed the rhythm, so I rolled back to the strict grid from version 8.
+- **Telling vibrato apart from real ornaments.** Heuristics can't do this reliably. Some vibrato still slips through as short notes, and fixing that would take a trained model.
+- **Stale caches.** Old cached files kept getting reused after I changed the logic, so a fix wouldn't show up and I couldn't tell why. Now the cached score, melody, and beat grid each carry a version number, and a mismatch forces a rebuild.
+- **Patching dropped beats one at a time.** madmom dropped 19 beats on Lift Me Up, mostly in quiet passages, and the score came out 5 measures short (111 instead of 116). My first fix compared each gap to the gaps around it, but the dropouts were bunched together, so it only found 4 of them. Rebuilding the whole grid from one steady pulse fixed it.
+- **Pulling the melody out of a loud mix.** Melodia and Basic Pitch both lost the lead when it wasn't louder than the backing. On Lift Me Up the pitch confidence stayed near zero and the line slid down to the bass. So the instrumental line only fills vocal rests, and notes below C3 are kept out of it.
 
 ## Install
 
-Requires Python 3.11 and [ffmpeg](https://ffmpeg.org)
-(`brew install ffmpeg` on macOS).
+You need Python 3.10 and ffmpeg (`brew install ffmpeg` on a Mac).
 
 ```bash
 git clone https://github.com/Bomberman1359/PyScribe.git
-cd YOUR_REPO
-python3.11 -m venv piano_env
-source piano_env/bin/activate
+cd PyScribe
+python3.10 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+mkdir -p data/input
 ```
 
-If `madmom` fails to build, see the note inside `requirements.txt`.
+madmom is installed from GitHub on purpose. The PyPI release (0.16.1) doesn't build with current versions of pip.
 
-## Use
+## Usage
 
-**Interactive (recommended):**
+Put a song in `data/input/`, then:
 
 ```bash
-python pipeline.py
+python pipeline.py                                     # asks for the file, title, composer, and seed
+python pipeline.py "data/input/song.mp3"               # default sheet
+python pipeline.py "data/input/song.mp3" 7             # a variation, seed 7
+python pipeline.py "data/input/song.mp3" 7 "My Song" "Me"
 ```
 
-You'll be asked for the audio file (place songs in `data/input/`), an optional
-seed, and whether to regenerate from scratch. The final sheet lands in
-`output/<song>/` — open the file the pipeline names as **DONE** in MuseScore
-(files with `_base`/`_silenced` in the name are intermediates).
+The title and composer are printed at the top of the sheet. Leave the title blank to use the file name, and leave the composer blank to leave it off.
 
-**Programmatic:**
+The finished score is `output/<song>/FINAL_<song>.musicxml`. The numbered files next to it are the stages in build order.
+
+From Python:
 
 ```python
 from pipeline import run_pipeline
-final_xml = run_pipeline("data/input/song.mp3", seed=None, force=False)
+
+final_xml = run_pipeline("data/input/song.mp3", seed=None, force=False,
+                        title="My Song", composer="Me")
 ```
 
-**Web demo (local):**
+To run the web demo on your own computer:
 
 ```bash
-python app.py    # then open http://127.0.0.1:7860
+python app.py        # then open http://127.0.0.1:7860
 ```
 
-## A note on copyright
+Demucs and CREPE are the slow stages. Both get cached, so a rerun of the same song is quick.
 
-This repo contains no copyrighted audio. The included example ("Lift Me Up") is
-my own composition. The tool transcribes audio you supply; what you do with
-transcriptions of other people's music is subject to the usual copyright rules.
+## Tests
+
+```bash
+python test_passes.py
+```
+
+33 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed.
+
+## Limits
+
+- The melody comes from the vocals, so songs without singing don't work well yet. A separate path for instrumental songs is planned.
+- Everything is written in 4/4, and chords are major or minor triads.
+- Some vibrato still shows up as short notes.
+
+## Copyright
+
+The only audio in this repo is Lift Me Up, which I wrote. PyScribe transcribes whatever audio you give it, so only use songs you have the rights to.
 
 ## Built with
 
-[Demucs](https://github.com/facebookresearch/demucs) ·
-[torchcrepe](https://github.com/maxrmorrison/torchcrepe) ·
-[madmom](https://github.com/CPJKU/madmom) ·
-[Basic Pitch](https://github.com/spotify/basic-pitch) ·
-[music21](https://github.com/cuthbertLab/music21) ·
-[librosa](https://librosa.org) · pretty_midi
+[Demucs](https://github.com/facebookresearch/demucs), [torchcrepe](https://github.com/maxrmorrison/torchcrepe), [madmom](https://github.com/CPJKU/madmom), [Basic Pitch](https://github.com/spotify/basic-pitch), [music21](https://github.com/cuthbertLab/music21), [librosa](https://librosa.org), [pretty_midi](https://github.com/craffel/pretty-midi), and [Gradio](https://www.gradio.app).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-Built and iterated over a year as an independent project. Full development
-journal available on request.
+MIT. See [LICENSE](LICENSE).

@@ -1,24 +1,20 @@
-# Core numerics -- madmom and older MIR code expect numpy 1.x APIs
-numpy<2.0
-scipy
+# Tested on Python 3.10 with these exact versions.
+numpy==1.26.4
+scipy==1.15.3
+setuptools==69.5.1      # librosa 0.9.2 still imports pkg_resources
+librosa==0.9.2
+soundfile==0.13.1
+pretty_midi==0.2.11
+music21==9.9.1
+torch==2.2.2
+torchaudio==2.2.2
+torchcrepe==0.0.24
+demucs==4.0.1
+basic-pitch==0.4.0
 
-# Audio / MIR
-librosa
-soundfile
-pretty_midi
-music21
+# The PyPI release of madmom (0.16.1) doesn't build with current pip,
+# so it's installed from GitHub instead.
+madmom @ git+https://github.com/CPJKU/madmom@27f032e8947204902c675e5e341a3faf5dc86dae
 
-# Models
-torch
-torchcrepe
-demucs
-basic-pitch
-
-# Beat tracking. If this fails to build (common on Python 3.11), run:
-#   pip install cython "numpy<2.0"
-#   pip install git+https://github.com/CPJKU/madmom
-# (pipeline.py already contains the runtime collections/np.float compat patch)
-madmom
-
-# Web demo only (app.py) -- safe to leave installed either way
-gradio
+# web demo (app.py)
+gradio==6.28.0
