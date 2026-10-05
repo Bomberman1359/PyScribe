@@ -2,6 +2,7 @@
 
 PyScribe turns a song into piano sheet music you can actually play. You give it an mp3 or wav, and it gives back a two-hand piano arrangement as a MusicXML file that opens in MuseScore.
 
+**Web app:** [chunhweechoi--pyscribe-web.modal.run](https://chunhweechoi--pyscribe-web.modal.run) if you want to try it without installing anything. A 3-minute song takes 3 to 4 minutes. It runs on free GPU credits, so it's limited to 12 songs a day, each up to 6 minutes long.  
 **Demo video:** coming soon
 
 ![First page of the Lift Me Up transcription in MuseScore](examples/lift_me_up_page1.png)
@@ -28,7 +29,7 @@ The melody comes from the vocal stem, the chords come from the bass and backing 
 
 Every stage saves its output in `output/<song>/`, so a rerun only redoes what changed. Cached files carry a version number (`GS_VERSION`, `MEL_VERSION`, `BEAT_REPAIR_VERSION`), and a mismatch forces a rebuild.
 
-Without a seed you get the same sheet every time. A seed nudges the melody timing and picks different left-hand textures, so you can make a few versions and keep the one you like.
+Without a seed you get the same sheet every time, as long as the stems are cached. Separating the song again changes some notes, because Demucs shifts the audio by a random amount on every run. Two fresh runs of Lift Me Up matched on 485 of 534 melody notes and 545 of 572 left-hand notes. A seed nudges the melody timing and picks different left-hand textures, so you can make a few versions and keep the one you like.
 
 ## Design decisions
 
@@ -90,7 +91,15 @@ To run the web demo on your own computer:
 python app.py        # then open http://127.0.0.1:7860
 ```
 
-Demucs and CREPE are the slow stages. Both get cached, so a rerun of the same song is quick.
+Demucs and CREPE are the slow stages. Both get cached, so a rerun of the same song is quick. Both also use an NVIDIA GPU when there is one. Lift Me Up takes about 30 minutes on my laptop's CPU and 3 to 4 minutes on a T4.
+
+The web app runs on [Modal](https://modal.com) from `modal_app.py`. A small CPU container serves the page, and songs run one at a time in a T4 container that shuts off when nothing is waiting. To host your own copy:
+
+```bash
+pip install modal
+modal setup
+modal deploy modal_app.py
+```
 
 ## Tests
 
@@ -112,7 +121,7 @@ The only audio in this repo is Lift Me Up, which I wrote. PyScribe transcribes w
 
 ## Built with
 
-[Demucs](https://github.com/facebookresearch/demucs), [torchcrepe](https://github.com/maxrmorrison/torchcrepe), [madmom](https://github.com/CPJKU/madmom), [Basic Pitch](https://github.com/spotify/basic-pitch), [music21](https://github.com/cuthbertLab/music21), [librosa](https://librosa.org), [pretty_midi](https://github.com/craffel/pretty-midi), and [Gradio](https://www.gradio.app).
+[Demucs](https://github.com/facebookresearch/demucs), [torchcrepe](https://github.com/maxrmorrison/torchcrepe), [madmom](https://github.com/CPJKU/madmom), [Basic Pitch](https://github.com/spotify/basic-pitch), [music21](https://github.com/cuthbertLab/music21), [librosa](https://librosa.org), [pretty_midi](https://github.com/craffel/pretty-midi), [Gradio](https://www.gradio.app), and [Modal](https://modal.com).
 
 ## License
 

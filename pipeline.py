@@ -1322,6 +1322,7 @@ def run_crepe(vocals_wav, cache_npz):
             print(f"   loaded cached CREPE ({len(c['f0'])} frames)")
             return c["times"], c["f0"], c["conf"]
     vocals, _ = librosa.load(vocals_wav, sr=SR, mono=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"   # the GPU when there is one
     chunk = SR * CREPE_CHUNK_SEC
     n = int(np.ceil(len(vocals) / chunk))
     f0a, cfa = [], []
@@ -1330,7 +1331,7 @@ def run_crepe(vocals_wav, cache_npz):
         p, per = torchcrepe.predict(
             torch.tensor(vocals[s:e]).float().unsqueeze(0),
             SR, hop_length=HOP, fmin=CREPE_FMIN, fmax=CREPE_FMAX,
-            model=CREPE_MODEL, device="cpu", return_periodicity=True)
+            model=CREPE_MODEL, device=device, return_periodicity=True)
         f0a.append(np.atleast_1d(p.squeeze().cpu().numpy()))
         cfa.append(np.atleast_1d(per.squeeze().cpu().numpy()))
         print(f"   CREPE chunk {i+1}/{n}")
