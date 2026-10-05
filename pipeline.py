@@ -1167,8 +1167,9 @@ def fit_uniform_grid(beat_times, tol=GRID_FIT_TOL, need=GRID_FIT_COVERAGE):
     coverage = float(np.mean(np.abs(bt - (phase + k * tau)) <= tol * tau))
     if coverage < need:
         return bt, False, coverage, 60.0 / tau
-    k0 = int(np.floor((bt[0] - phase) / tau))
-    k1 = int(np.ceil((bt[-1] - phase) / tau))
+    # Start and end on the grid lines nearest the first and last tracked beats.
+    k0 = int(round((bt[0] - phase) / tau))
+    k1 = int(round((bt[-1] - phase) / tau))
     return phase + np.arange(k0, k1 + 1) * tau, True, coverage, 60.0 / tau
 
 

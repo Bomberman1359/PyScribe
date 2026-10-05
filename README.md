@@ -107,7 +107,7 @@ modal deploy modal_app.py
 python test_passes.py
 ```
 
-33 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed.
+34 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed.
 
 ## Limits
 

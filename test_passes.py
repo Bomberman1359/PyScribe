@@ -151,6 +151,12 @@ tracked = np.delete(true_beats, np.arange(300, 330, 2))
 grid, used, coverage, bpm = fit_uniform_grid(tracked)
 check("dropped beats in a quiet passage are put back", (used, len(grid)), (True, 457))
 check("rebuilt grid lands on the right tempo", round(bpm), 128)
+# A first beat that came in a hair early, or a last beat a hair late, added a
+# whole extra beat to the rebuilt grid. One at the start moves every bar line.
+edges = np.arange(200) * 0.5
+edges[0] -= 0.01; edges[-1] += 0.01
+grid, used, _, _ = fit_uniform_grid(edges)
+check("rebuilt grid starts and ends on the tracked beats", (used, len(grid)), (True, 200))
 # A song that speeds up has no single steady pulse, so its beats are kept.
 speeding_up = np.cumsum(60.0 / np.linspace(96, 104, 400))
 check("a song that speeds up keeps its tracked beats",
