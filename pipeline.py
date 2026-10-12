@@ -134,7 +134,7 @@ FRAGMENT_MERGE_MAX = 2   # same-pitch fragments fuse into notes up to this long
                          # (4 would fuse them into quarters instead of eighths)
 DD_FIX       = {7: 6, 14: 12}  # double-dotted quarter/half -> single-dotted
 CLEAN_DURS   = {1, 2, 3, 4, 6, 8, 12, 16}   # durations that read cleanly
-GS_VERSION   = 14  # bump when the grand staff logic changes. The base XML gets
+GS_VERSION   = 15  # bump when the grand staff logic changes. The base XML gets
                    # a .ver file with this number, and a mismatch makes the
                    # next run rebuild it instead of reusing a stale score.
 MEL_VERSION  = 5   # same idea for the melody chain (stages 5-7)
@@ -840,7 +840,7 @@ def build_part(tiled, total_u, clef, key, ts, name, pc_map, tempo=None):
         if b == 0:
             m.insert(0, clef); m.insert(0, ts)
             if key is not None: m.insert(0, key)
-            if tempo is not None: m.insert(0, m21.tempo.MetronomeMark(number=int(tempo)))
+            if tempo is not None: m.insert(0, m21.tempo.MetronomeMark(number=int(round(tempo))))
         bs = b*U_PER_BAR
         for e in [x for x in tiled if bs <= x['on'] < bs+U_PER_BAR]:
             ql, off = u_to_q(e['dur']), u_to_q(e['on']-bs)
