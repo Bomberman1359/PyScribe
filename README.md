@@ -1,5 +1,7 @@
 # PyScribe
 
+![tests](https://github.com/Bomberman1359/PyScribe/actions/workflows/tests.yml/badge.svg)
+
 PyScribe turns a song into piano sheet music you can actually play. You give it an mp3 or wav, and it gives back a two-hand piano arrangement as a MusicXML file that opens in MuseScore.
 
 **Web app:** [chunhweechoi--pyscribe-web.modal.run](https://chunhweechoi--pyscribe-web.modal.run) if you want to try it without installing anything. A 3-minute song takes 3 to 4 minutes. It runs on free GPU credits, so it's limited to 12 songs a day, each up to 6 minutes long.  
