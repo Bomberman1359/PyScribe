@@ -280,11 +280,9 @@ def build_ui(jobs):
             the left hand gets busier or calmer depending on the drums.
 
             **Heads up:** a 3-minute song takes about 3 to 4 minutes on the GPU server.
-            The server shuts off when nobody is using it, so the first song after a
-            quiet spell also waits for it to start. Keep this tab in view while the
-            song runs: the page only checks on it while you're looking, and the log
-            shows which stage it's on. Songs can be up to {MAX_MINUTES} minutes long,
-            and the site takes {MAX_PER_DAY} songs a day because it runs on free credits.
+            Keep this tab open until it's done. The log shows which stage it's on.
+            Songs can be up to {MAX_MINUTES} minutes long, and the site takes
+            {MAX_PER_DAY} songs a day because it runs on free credits.
             The code is on [GitHub]({GITHUB_URL}).
             """
         )
