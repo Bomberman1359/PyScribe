@@ -1,49 +1,5 @@
-#!/usr/bin/env python3
-# ============================================================================
-# pipeline.py: audio to piano sheet music
-# ============================================================================
-# Turns a song (mp3 or wav) into a two-staff piano score in MusicXML.
-#
-#   python pipeline.py "data/input/song.mp3"
-#   python pipeline.py "data/input/song.mp3" 42        # variant sheet, seed 42
-#   python pipeline.py "song.mp3" 42 "Title" "Composer"
-#   python pipeline.py                                 # asks for the file,
-#                                                      # title, composer, seed
-#
-# The melody comes from the vocal stem, the chords come from the bass and
-# instrumental stems, and both are quantized to one beat grid taken from the
-# audio. The grid is detected once and shared by every later stage, so the two
-# hands always agree on where the beats are.
-#
-# Each stage writes one file that the next stage reads. File names start with a
-# digit so the output folder sorts in build order, and the finished score starts
-# with FINAL_ so it sorts last.
-#
-#   Stage  Input           Output
-#   -----  --------------  ---------------------------------------------------
-#     0    audio           {vocals,bass,drums,other}.wav
-#     1    stems           accompaniment.wav
-#     2    accompaniment   2<song>_beats.npz            tempo + beat times
-#     3    vocals.wav      3<song>_crepe.npz            pitch contour
-#     4    contour         4<song>_vocals.mid           vocal note events
-#     5    vocals.wav      4<song>_vocals_patched.mid   recovered dropouts
-#     6    patched mid     4<song>_vocals_extended.mid  sustained note tails
-#     7    other.wav       4<song>_vocals_filled.mid    instrumental fills
-#     8    stems           6<song>_chords.mid           chord blocks
-#     9    mids            7<song>_base.musicxml        grand staff
-#    10    base xml        8<song>_silenced.musicxml    left hand rests
-#    11    silenced xml    FINAL_<song>.musicxml        final score
-#
-# Stems (stages 0-1) go in separated/htdemucs/<song>/ and everything else goes
-# in output/<song>/. A stage is skipped when its output already exists, and
-# rebuilding a stage rebuilds everything after it.
-#
-# Functions are defined in dependency order, not stage order. run_pipeline() at
-# the bottom is the actual run order.
-# ============================================================================
+# main transcriber pipeline code
 
-# madmom was written for older Python and NumPy. These aliases put back the
-# names it expects, and they have to run before madmom is imported.
 import collections, collections.abc
 collections.MutableSequence = collections.abc.MutableSequence
 import numpy as np
@@ -63,8 +19,6 @@ import soundfile as sf
 import pretty_midi
 import music21 as m21
 
-# torch and torchcrepe are imported inside run_crepe(). Both are slow to import
-# and only needed when the pitch contour is computed.
 try:
     import madmom
     HAS_MADMOM = True
@@ -72,129 +26,91 @@ except Exception:
     HAS_MADMOM = False
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-SR  = 16000                    # analysis sample rate for every stage
-HOP = 160                      # 10 ms frames (same hop as CREPE, so frames line up)
+# settings
+SR  = 16000
+HOP = 160
 DEMUCS_MODEL = "htdemucs"
-STEM_ROOT    = "separated"     # Demucs writes to separated/<model>/<song>/
-OUT_ROOT     = "output"        # intermediates and the final score: output/<song>/
-FORCE_REBUILD = False          # True: ignore existing files and rebuild every stage
+STEM_ROOT    = "separated"
+OUT_ROOT     = "output"
+FORCE_REBUILD = False
 
-# --- beat grid repair ---
-# madmom can skip a beat where the pulse is weak. Every skipped beat pulls the
-# rest of the song one beat earlier, so the score comes out short.
-BEAT_REPAIR_VERSION = 2  # bump to redo the repair on beat grids already cached
-GRID_FIT_TOL      = 0.20 # on the grid if within this fraction of a beat
-GRID_FIT_COVERAGE = 0.85 # share of beats that must fit one steady pulse to use it
-BEAT_GAP_TOL    = 0.18   # a gap this close to a whole number of beats is a dropout
-BEAT_LOCAL_WIN  = 9      # beats of context used to estimate the local interval
-BEAT_STEADY_MAX = 0.12   # a grid within this max and rms distance (in beats) of a
-BEAT_STEADY_RMS = 0.04   # straight line is a fixed tempo, and the line is used instead
+BEAT_REPAIR_VERSION = 2
+GRID_FIT_TOL      = 0.20
+GRID_FIT_COVERAGE = 0.85
+BEAT_GAP_TOL    = 0.18
+BEAT_LOCAL_WIN  = 9
+BEAT_STEADY_MAX = 0.12
+BEAT_STEADY_RMS = 0.04
 
-# --- pitch contour (CREPE) ---
-CREPE_MODEL     = "full"       # the note thresholds below were tuned on the full model
-CREPE_CHUNK_SEC = 30           # seconds of audio per CREPE call
+CREPE_MODEL     = "full"
+CREPE_CHUNK_SEC = 30
 CREPE_FMIN, CREPE_FMAX = 60, 1000
 
-# --- vocal note segmentation ---
-V_DEPTH_RATIO   = 0.45   # a dip to this share of the peaks = new attack
-V_MIN_FRAMES    = 8      # shortest note kept, in frames (80 ms)
-V_CONF_THRESH   = 0.50   # pitch confidence below which a frame is unvoiced
-V_PITCH_TOL     = 0.60   # semitones of drift tolerated inside one held note
-V_BRIDGE_FRAMES = 10     # unvoiced frames that may be bridged within a note
-V_MIDI_LO, V_MIDI_HI = 48, 84   # C3 to C6: notes outside singing range are dropped
+V_DEPTH_RATIO   = 0.45
+V_MIN_FRAMES    = 8
+V_CONF_THRESH   = 0.50
+V_PITCH_TOL     = 0.60
+V_BRIDGE_FRAMES = 10
+V_MIDI_LO, V_MIDI_HI = 48, 84
 
-# --- sustained note tails ---
-EXT_HOLD_FRAC    = 0.25  # gap energy above this share of a normal note = still held
-EXT_MAX_FILL_SEC = 1.0   # never extend a note across a gap longer than this
+EXT_HOLD_FRAC    = 0.25
+EXT_MAX_FILL_SEC = 1.0
 
-# --- chord recognition ---
-CH_HOP = 512             # chroma frame hop
-CH_BASS_REGISTER = 3     # octave the detected chords are voiced in
+CH_HOP = 512
+CH_BASS_REGISTER = 3
 CH_ROOT_WEIGHT, CH_THIRD_WEIGHT, CH_FIFTH_WEIGHT = 1.6, 1.0, 1.0
-# reward / penalty when a chord's root does / doesn't match the bass stem
 CH_BASS_VETO_MULT, CH_BASS_PENALTY_MULT = 1.5, 0.5
 CH_LOW_CONF_MARGIN = 0.55
 
-# --- grand staff ---
-# Everything is measured in sixteenth notes: 4 per beat, 16 per bar.
 U_PER_BEAT  = 4
 U_PER_BAR   = 16
-BASS_OCTAVE = 3          # octave the left-hand chords start from
-CHORD_SNAP_UNITS  = 4    # chord changes snap to the beat
-LEGATO_FILL_UNITS = 2    # a melody gap this short is closed by holding the note
-MELODY_COARSE     = 2    # default melody grid: the eighth note
-RUN_KEEP_16TH     = True # keep real sixteenth runs as sixteenths
-RUN_MIN_LEN       = 2    # sixteenths in a row that count as a run (3 keeps fewer runs)
-MERGE_GAP_UNITS   = 0    # largest gap that may be closed when merging notes
-FRAGMENT_UNITS    = 1    # a note this short is a fragment left by quantization
-FRAGMENT_MERGE_MAX = 2   # same-pitch fragments fuse into notes up to this long
-                         # (4 would fuse them into quarters instead of eighths)
-DD_FIX       = {7: 6, 14: 12}  # double-dotted quarter/half -> single-dotted
-CLEAN_DURS   = {1, 2, 3, 4, 6, 8, 12, 16}   # durations that read cleanly
-GS_VERSION   = 15  # bump when the grand staff logic changes. The base XML gets
-                   # a .ver file with this number, and a mismatch makes the
-                   # next run rebuild it instead of reusing a stale score.
-MEL_VERSION  = 5   # same idea for the melody chain (stages 5-7)
+BASS_OCTAVE = 3
+CHORD_SNAP_UNITS  = 4
+LEGATO_FILL_UNITS = 2
+MELODY_COARSE     = 2
+RUN_KEEP_16TH     = True
+RUN_MIN_LEN       = 2
+MERGE_GAP_UNITS   = 0
+FRAGMENT_UNITS    = 1
+FRAGMENT_MERGE_MAX = 2
+DD_FIX       = {7: 6, 14: 12}
+CLEAN_DURS   = {1, 2, 3, 4, 6, 8, 12, 16}
+GS_VERSION   = 15
+MEL_VERSION  = 5
 
-# --- left-hand rests and accompaniment texture ---
-SIL_FLOOR_FRAC = 0.15    # a chord is "dead" when bass.wav and other.wav are
-                         # both below this share of their median level
-SIL_GATE_BEATS = 2.0     # dead chords become rests once they last this many beats
-ACC_SMOOTH_SEC = 3.0     # drum activity is averaged over +/- this many seconds
-                         # before a passage is sorted as calm, medium, or busy
+SIL_FLOOR_FRAC = 0.15
+SIL_GATE_BEATS = 2.0
+ACC_SMOOTH_SEC = 3.0
 
-# --- register repair and chromatic cleanup ---
-TREBLE_LOW_MEDIAN = 55   # G3. Melody runs at or below this get lifted an octave.
-                         # It's the only rule that moves the melody. When the
-                         # hands collide, the left hand moves instead.
-TREBLE_TINY_LOW   = 50   # D3. One or two low notes only get lifted below this
-TREBLE_PHRASE_GAP = 8    # half a bar of rest ends a phrase
-BASS_DROP_FLOOR   = 24   # C1. A left-hand chord is never dropped below this
-CHROMA_BLIP_MAX   = 2    # an off-key half-step artifact must be an eighth or shorter
-CHD_FIX_MAX_BEATS = 2.0  # the diatonic chord guard only considers blocks this short
+TREBLE_LOW_MEDIAN = 55
+TREBLE_TINY_LOW   = 50
+TREBLE_PHRASE_GAP = 8
+BASS_DROP_FLOOR   = 24
+CHROMA_BLIP_MAX   = 2
+CHD_FIX_MAX_BEATS = 2.0
 
-# --- melody recovery and instrumental fill ---
-ENABLE_REST_FILL = True # False: skip stage 7, instrumental sections stay as rests
-VGAP_GATE_BEATS = 2.0   # vocal gaps this long (in beats) can be patched in stage 5
-VPATCH_CONF     = 0.50  # beats whose voiced frames average below this are unreliable
-                        # (usually CREPE jumping between stacked voices)
-VPATCH_MIN_BEATS = 4.0  # and must last this many beats before notes get replaced
+ENABLE_REST_FILL = True
+VGAP_GATE_BEATS = 2.0
+VPATCH_CONF     = 0.50
+VPATCH_MIN_BEATS = 4.0
 
-# Stage 5 only edits spans where someone is actually singing. In instrumental
-# sections the vocal stem only has bleed from the other instruments, so those
-# sections are left for the instrumental fill (stage 7).
-VOCAL_FLOOR_FRAC  = 0.15  # voice counts as present at this share of its singing level
-VOCAL_ACTIVE_MIN  = 0.35  # fraction of frames in a span that must reach that level
-VOCAL_OTHER_SHARE = 0.20  # and the vocal stem must be at least this loud vs other.wav
+VOCAL_FLOOR_FRAC  = 0.15
+VOCAL_ACTIVE_MIN  = 0.35
+VOCAL_OTHER_SHARE = 0.20
 
-ZIGZAG_MIN_NOTES = 7     # a bar is thinned only if it has at least this many notes
-ZIGZAG_FRAC      = 0.6   # and this share of its steps are leaps that change direction
-                         # (repeats and steps count as 0, so fast repeated
-                         # figures and melisma runs never get thinned)
-ZIGZAG_LEAP      = 3     # semitones; the smallest step counted as a leap
-FILL_GATE_BEATS  = 4.0   # a vocal rest must be at least one full bar to be filled
-FILL_MIN_NOTES   = 2     # and hold at least this many instrumental notes
+ZIGZAG_MIN_NOTES = 7
+ZIGZAG_FRAC      = 0.6
+ZIGZAG_LEAP      = 3
+FILL_GATE_BEATS  = 4.0
+FILL_MIN_NOTES   = 2
 
-# --- seeded variants ---
-# No seed gives the same sheet every time. A seed nudges the melody
-# timing before quantization and picks a different accompaniment
-# texture for each section.
-SEED_MELODY_JITTER = 0.35 # notes are nudged up to this many sixteenths before snapping
-                          # (only notes near a cell boundary end up moving)
+SEED_MELODY_JITTER = 0.35
 MEDIUM_MENU = ["pulse", "asc_ninth", "asc_twelfth"]
 BUSY_MENU   = ["climb", "updown", "pump"]
 CALM_MENU   = ["block", "inv1", "inv2", "open5", "oct158"]
-# Slot 0 of each menu is the default. A seed picks one texture per section, so
-# a section keeps the same accompaniment. To add a texture, append it to a menu
-# and write it in acc_build() (or acc_block_pitches() for calm voicings).
 
 
-# ============================================================================
-# VOCAL NOTE SEGMENTATION
-# ============================================================================
+# vocal note helpers
 def hz_to_midi(f):
     f = np.asarray(f, float); out = np.full_like(f, np.nan); m = f > 0
     out[m] = 69 + 12 * np.log2(f[m] / 440.0); return out
@@ -213,9 +129,6 @@ def _smooth(x, win=5):
     return np.convolve(x, k, mode='same')
 
 def rearticulations_from_rms(rms, voiced, depth_ratio=0.55, look=20, min_sep=8):
-    """Find re-articulations: dips in vocal energy deep enough that the singer
-    struck the note again instead of holding it. A dip counts when it falls to
-    `depth_ratio` of the smaller peak on either side."""
     sm = _smooth(np.asarray(rms, float), 3); n = len(sm)
     art = np.zeros(n, bool); last = -min_sep
     for i in range(1, n - 1):
@@ -233,16 +146,6 @@ def extract_notes_fused_v2(times, f0, conf, rms,
                            conf_thresh=0.5, pitch_tol=0.6, min_frames=4,
                            bridge_frames=10, depth_ratio=0.55, smooth_win=17,
                            min_plateau=6, rms_floor_ratio=0.15):
-    """Turn the frame-by-frame pitch contour into notes.
-
-    A note ends at an energy re-articulation or at a pitch change that lasts
-    at least `min_plateau` frames, so a quick wobble inside a held note
-    stays one note. The contour is median-smoothed over `smooth_win` frames
-    (about one vibrato cycle) so vibrato doesn't chop a long note into short
-    ones. Short unvoiced gaps are bridged if the pitch comes back at the
-    same place with no new attack.
-
-    Returns [(start_sec, end_sec, midi_pitch), ...]."""
     midi = hz_to_midi(f0)
     voiced = (conf >= conf_thresh) & np.isfinite(midi)
     base = np.where(voiced, midi, np.nan)
@@ -283,9 +186,6 @@ def extract_notes_fused_v2(times, f0, conf, rms,
     return notes
 
 def fix_octave_outliers(notes, window=5, jump=11):
-    """Move notes that sit `jump` or more semitones from the local median
-    back by whole octaves. Fixes octave errors without changing a pitch
-    class or deleting a note."""
     if len(notes) < 3: return notes
     p = np.array([x[2] for x in notes], float)
     center = np.array([np.median(p[max(0, k - window):min(len(p), k + window + 1)])
@@ -301,9 +201,6 @@ def fix_octave_outliers(notes, window=5, jump=11):
 
 
 def fix_intro_octaves(notes, intro_sec=8.0, jump=10, min_reliable=8):
-    """Octave repair for the first `intro_sec` seconds, where there isn't
-    enough context yet for a rolling median. Those notes are folded toward the
-    median of the rest of the song."""
     if len(notes) < min_reliable: return notes
     pitches = np.array([p for *_, p in notes], float); starts = np.array([s for s, _, _ in notes], float)
     body = pitches[starts >= intro_sec]
@@ -317,15 +214,11 @@ def fix_intro_octaves(notes, intro_sec=8.0, jump=10, min_reliable=8):
     return out
 
 
-# ============================================================================
-# CHORD RECOGNITION
-# ============================================================================
+# chord helpers
 def note_names():
     return ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 def generate_templates():
-    """Build the 24 major/minor chroma templates (weighted toward the root) and
-    the MIDI notes used to voice each chord."""
     names = note_names()
     maj_base = np.zeros(12)
     maj_base[0] = CH_ROOT_WEIGHT; maj_base[4] = CH_THIRD_WEIGHT; maj_base[7] = CH_FIFTH_WEIGHT
@@ -343,12 +236,6 @@ def generate_templates():
     return templates
 
 def match_chord(chroma_other, chroma_bass, start, end, templates, names, sr, hop):
-    """Score every chord template against one beat and return the best one.
-
-    Harmony comes from the instrumental stem and the root from the bass stem. A
-    chord whose root matches the bass note gets a boost and one that doesn't
-    gets a penalty, scaled by how clear the bass note is. `margin` is how far
-    the winner beat the runner-up, used later to spot weak guesses."""
     f0 = librosa.time_to_frames(start, sr=sr, hop_length=hop)
     f1 = librosa.time_to_frames(end, sr=sr, hop_length=hop)
     f1 = max(f1, f0 + 1)
@@ -387,15 +274,6 @@ def snap_to_grid(t, grid_unit):
     return round(t / grid_unit) * grid_unit
 
 def fix_nondiatonic_blocks(merged, templates, beat_dur):
-    """Remove single out-of-key chords that come from chroma misfires.
-
-    The key is the diatonic set that covers the most chord time. A block gets
-    replaced by its longer in-key neighbor only if it is short (at most
-    CHD_FIX_MAX_BEATS), off-key, and weakly matched (margin below the song's
-    median). Long or confident off-key chords stay, so real borrowed chords
-    and key changes survive.
-
-    Returns (blocks, number_replaced)."""
     if len(merged) < 3: return merged, 0
     pcset = lambda name: {p % 12 for p in templates[name]['midi']}
     best_set, best_cov = set(range(12)), -1.0
@@ -432,8 +310,8 @@ def fix_nondiatonic_blocks(merged, templates, beat_dur):
                 nxt['start'] = c['start']; nxt['margins'] = c['margins'] + nxt['margins']
                 fixed += 1; i += 1; continue
         res.append(c); i += 1
-    out = []                                   # absorbing can leave two touching
-    for c in res:                              # blocks of the same chord: re-merge
+    out = []
+    for c in res:
         if out and out[-1]['name'] == c['name'] and abs(out[-1]['end'] - c['start']) < 1e-3:
             out[-1]['end'] = c['end']; out[-1]['margins'] += c['margins']
         else:
@@ -441,23 +319,12 @@ def fix_nondiatonic_blocks(merged, templates, beat_dur):
     return out, fixed
 
 
-# ============================================================================
-# SCORE ASSEMBLY (stage 9)
-#
-# Everything below works on "events", dicts like
-#     {'on': int, 'dur': int, 'kind': 'note'|'chord'|'rest', 'payload': ...}
-# where `on` and `dur` are in sixteenth notes and `payload` is a MIDI pitch
-# (note), a list of pitches (chord), or None (rest).
-# ============================================================================
+# stage 9 grand staff
 def q_to_u(ql): return int(round(float(ql) * U_PER_BEAT))
 def u_to_q(u):  return u * (1.0 / U_PER_BEAT)
 def snap(u, grid): return int(round(u / grid)) * grid
 
 def clean_melody_rhythm(events, coarse=MELODY_COARSE):
-    """Quantize the melody: eighth-note grid by default, sixteenth grid
-    for real sixteenth runs (at least RUN_MIN_LEN sixteenths in a row).
-    A longer note right after a run still snaps to eighths, so it
-    doesn't turn syncopated."""
     if not events: return events
     on  = [e['on'] for e in events]
     end = [e['on'] + e['dur'] for e in events]
@@ -468,7 +335,7 @@ def clean_melody_rhythm(events, coarse=MELODY_COARSE):
         linked = [k < n - 1 and dur[k] == 1 and dur[k + 1] == 1
                   and on[k + 1] - on[k] == 1 for k in range(n)]
         k = 0
-        while k < n:                                  # walk maximal sixteenth chains
+        while k < n:
             j = k
             while j < n - 1 and linked[j]: j += 1
             if (j - k + 1) >= RUN_MIN_LEN:
@@ -486,9 +353,6 @@ def clean_melody_rhythm(events, coarse=MELODY_COARSE):
     return out
 
 def fold_octave_outliers_events(events, window=5, jump=11):
-    """Octave repair on the combined melody. The vocal and instrumental stages
-    fix their own octave errors, but an outlier can still show up where the two
-    meet. Notes only move by whole octaves and none are deleted."""
     if len(events) < 3: return events
     p = np.array([e['payload'] for e in events], float)
     out = []
@@ -509,15 +373,9 @@ def _diatonic_pcs(key):
     iv = [0, 2, 4, 5, 7, 9, 11] if mode == 'major' else [0, 2, 3, 5, 7, 8, 10, 11]
     return {(tonic + i) % 12 for i in iv}
 
-TRILL_MAX_UNITS = 3   # members of a trill must be a dotted eighth or shorter
+TRILL_MAX_UNITS = 3
 
 def collapse_halfstep_trills(events, key):
-    """Collapse half-step vibrato into one note.
-
-    Vibrato that crosses a semitone gets transcribed as a fast trill between
-    two pitches, and one of them is usually out of key. A run of 3+ short
-    alternating notes becomes one note at the in-key pitch. If both pitches are
-    in key it's a real neighbor-tone figure and it stays."""
     if len(events) < 3: return events
     pcs = _diatonic_pcs(key)
     out, i = [], 0
@@ -545,13 +403,6 @@ def collapse_halfstep_trills(events, key):
 
 
 def collapse_chromatic_neighbors(events, key):
-    """Clean up single out-of-key notes left by pitch slides.
-
-    A short off-key note (at most CHROMA_BLIP_MAX) a half step from a touching
-    in-key note is really the bent start or end of that note. If they touch, it
-    gets absorbed into the neighbor (the longer one if both qualify). If
-    there's a small gap, it keeps its rhythm but takes the neighbor's pitch.
-    Longer off-key notes are left alone, so real accidentals stay."""
     if len(events) < 2: return events
     pcs = _diatonic_pcs(key)
     ev = [dict(e) for e in events]
@@ -575,31 +426,19 @@ def collapse_chromatic_neighbors(events, key):
         if take is None:
             out.append(e)
         elif take is prv and e['on'] == prv['on'] + prv['dur']:
-            prv['dur'] += e['dur']                          # fold back into prev
+            prv['dur'] += e['dur']
         elif take is nxt and nxt['on'] == e['on'] + e['dur']:
-            nxt['on'] = e['on']; nxt['dur'] += e['dur']     # fold forward into next
+            nxt['on'] = e['on']; nxt['dur'] += e['dur']
         else:
-            e['payload'] = int(take['payload'])             # gapped: repitch, keep
+            e['payload'] = int(take['payload'])
             out.append(e)
         i += 1
     return out
 
 def merge_same_pitch(events, max_gap):
-    """Merge same-pitch notes that came from one sung note, without merging
-    notes that were actually sung twice.
-
-      fragment + full note: a slide or re-trigger chipped a fragment (at most
-          FRAGMENT_UNITS) off a longer note. The fragment is absorbed.
-      fragment + fragment: a held note re-triggering shows up as a stream of
-          sixteenths. They fuse into notes of at most FRAGMENT_MERGE_MAX, so
-          the stream reads as eighths instead of one long note.
-      full note + full note: a repeated syllable. Never merged.
-
-    The cap counts from the first fragment in a group, so one merge can't
-    snowball into eating the whole stream."""
     if not events: return events
     out = [dict(events[0])]
-    head = out[0]['dur']                       # length of the group's first note
+    head = out[0]['dur']
     for e in events[1:]:
         p = out[-1]
         gap = e['on'] - (p['on'] + p['dur'])
@@ -610,7 +449,7 @@ def merge_same_pitch(events, max_gap):
             if head_frag and e_frag:
                 ok = merged <= FRAGMENT_MERGE_MAX
             else:
-                ok = head_frag != e_frag       # exactly one side is a fragment
+                ok = head_frag != e_frag
             if ok:
                 p['dur'] = merged
                 continue
@@ -620,20 +459,9 @@ def merge_same_pitch(events, max_gap):
 
 
 def merge_same_pitch_grid(events, max_gap=0):
-    """Same-pitch merge again after quantization, since rounding can put two
-    pieces of one note on neighboring cells."""
     return merge_same_pitch(events, max_gap)
 
 def declutter_zigzag_bars(events):
-    """Thin out bars that are transcription spray instead of music.
-
-    With stacked harmony vocals, a one-voice pitch tracker jumps between the
-    voices and fills the bar with big leaps that change direction almost every
-    note. A bar gets thinned only if it has at least ZIGZAG_MIN_NOTES notes and
-    at least ZIGZAG_FRAC of its steps are direction-changing leaps of
-    ZIGZAG_LEAP or more semitones. Repeated notes and steps count as 0, so fast
-    repeated figures and melisma runs never qualify. A thinned bar keeps the
-    longest note in each half-beat, stretched to the next kept note."""
     if not events: return events
     bars = {}
     for e in events:
@@ -647,11 +475,11 @@ def declutter_zigzag_bars(events):
         flips = sum(1 for a, b in zip(deltas, deltas[1:])
                     if a != 0 and b != 0 and (a > 0) != (b > 0)
                     and abs(a) >= ZIGZAG_LEAP and abs(b) >= ZIGZAG_LEAP)
-        frac = flips / max(1, len(deltas) - 1)     # repeats and steps pull this down
+        frac = flips / max(1, len(deltas) - 1)
         if frac < ZIGZAG_FRAC:
             out += notes; continue
         cells = {}
-        for e in notes:                                  # longest note per half-beat
+        for e in notes:
             cells.setdefault(e['on'] // 2, []).append(e)
         kept = sorted((max(v, key=lambda e: e['dur']) for v in cells.values()),
                       key=lambda e: e['on'])
@@ -666,20 +494,13 @@ def declutter_zigzag_bars(events):
     return out
 
 def lift_low_treble_runs(events):
-    """Lift melody that fell below the treble staff back up.
-
-    A run is a stretch of notes in one phrase that all sit at or below
-    TREBLE_LOW_MEDIAN. Runs of 3+ notes move up by whole octaves together
-    until their median is back at the threshold, so the contour stays the
-    same. One or two notes only move if they sit below TREBLE_TINY_LOW. Notes
-    above the threshold never move."""
     if not events: return events
     out = [dict(e) for e in events]
     i = 0
     while i < len(out):
         if out[i]['payload'] > TREBLE_LOW_MEDIAN:
             i += 1; continue
-        j = i                                   # grow the low run within the phrase
+        j = i
         while (j + 1 < len(out)
                and out[j + 1]['payload'] <= TREBLE_LOW_MEDIAN
                and out[j + 1]['on'] - (out[j]['on'] + out[j]['dur']) < TREBLE_PHRASE_GAP):
@@ -696,12 +517,6 @@ def lift_low_treble_runs(events):
     return out
 
 def drop_bass_collisions(cevents, vevents):
-    """Drop a left-hand chord one octave when it runs into a low melody note.
-
-    This only happens when the overlapping melody note is itself low (at or
-    below TREBLE_LOW_MEDIAN) and the chord reaches up to it, which is mostly
-    the one- or two-note figures the treble lift leaves alone. A chord never
-    goes below BASS_DROP_FLOOR."""
     if not vevents: return cevents
     out = []
     for c in cevents:
@@ -710,10 +525,10 @@ def drop_bass_collisions(cevents, vevents):
                 if v['on'] < nc['on'] + nc['dur'] and nc['on'] < v['on'] + v['dur']]
         if lows:
             low = min(lows)
-            if (low <= TREBLE_LOW_MEDIAN                  # melody note is low,
-                    and low <= max(nc['payload'])         # the chord reaches it,
-                    and min(nc['payload']) - 12 >= BASS_DROP_FLOOR):  # and there's room
-                nc['payload'] = [p - 12 for p in nc['payload']]       # drop one octave
+            if (low <= TREBLE_LOW_MEDIAN
+                    and low <= max(nc['payload'])
+                    and min(nc['payload']) - 12 >= BASS_DROP_FLOOR):
+                nc['payload'] = [p - 12 for p in nc['payload']]
         out.append(nc)
     return out
 
@@ -739,8 +554,6 @@ def spelled_pitch(midi, pc_map):
     return p
 
 def compact_triad(midi_pitches):
-    """Voice a chord as a close-position triad (root, third, fifth)
-    starting at BASS_OCTAVE."""
     pcs = sorted(set(p % 12 for p in midi_pitches))
     root_pc = min(midi_pitches) % 12
     def nearest(target, tol):
@@ -768,11 +581,6 @@ def merge_identical(chords):
     return out
 
 def tile_voice(events, total_u, legato=0):
-    """Turn a list of notes into a gap-free line that covers the whole piece.
-
-    Overlaps get clipped at the next note, gaps become rests (or get closed by
-    holding the previous note if they're `legato` units or less), and notes
-    that cross a barline are split into tied pieces."""
     clean = []
     for i, e in enumerate(events):
         on, dur = e['on'], e['dur']
@@ -811,8 +619,6 @@ def _tie(el, e):
     elif e.get('tie_stop'):  el.tie = m21.tie.Tie('stop')
 
 def apply_key_accidentals(part, key):
-    """Show an accidental only where it changes the pitch within the measure,
-    and hide the ones the key signature already covers."""
     keymap = {p.step: p.accidental.alter for p in key.alteredPitches}
     for m in part.getElementsByClass('Measure'):
         state = {}
@@ -833,7 +639,6 @@ def apply_key_accidentals(part, key):
     return part
 
 def build_part(tiled, total_u, clef, key, ts, name, pc_map, tempo=None):
-    """Write a tiled event list into a music21 Part, one measure at a time."""
     part = m21.stream.Part(); part.partName = name
     for b in range((total_u + U_PER_BAR - 1)//U_PER_BAR):
         m = m21.stream.Measure(number=b+1)
@@ -858,18 +663,10 @@ def build_part(tiled, total_u, clef, key, ts, name, pc_map, tempo=None):
 
 
 def consolidate_melody(events, merge_gap=None):
-    """Same-pitch merge on the melody, before quantization."""
     if merge_gap is None: merge_gap = MERGE_GAP_UNITS
     return merge_same_pitch(events, merge_gap)
 
 def redistribute_double_dots(tiled):
-    """Get rid of double-dotted notes and rests.
-
-    A double-dotted quarter or half becomes single-dotted and hands the extra
-    sixteenth (or two) to the next event. If that would leave the next event on
-    an awkward length, the note grows to a clean length instead and the next
-    event gets shorter. Only touching, untied pairs in the same measure change,
-    so bar lengths and ties stay correct."""
     if not tiled: return tiled
     out = [dict(e) for e in tiled]
     for i in range(len(out) - 1):
@@ -879,27 +676,19 @@ def redistribute_double_dots(tiled):
         if a['on'] // U_PER_BAR != e['on'] // U_PER_BAR: continue
         if (a.get('tie_start') or a.get('tie_stop')
                 or e.get('tie_start') or e.get('tie_stop')): continue
-        shift = a['dur'] - DD_FIX[a['dur']]              # 1 for a 7, 2 for a 14
+        shift = a['dur'] - DD_FIX[a['dur']]
         give_clean = (e['dur'] + shift) in CLEAN_DURS
         take_clean = (e['dur'] - shift) >= 1 and (e['dur'] - shift) in CLEAN_DURS
-        if give_clean or not take_clean:                 # give time to the next event
+        if give_clean or not take_clean:
             a['dur'] = DD_FIX[a['dur']]
             e['on'] -= shift; e['dur'] += shift
-        else:                                            # take: grow to a clean 8/16
+        else:
             a['dur'] += shift
             e['on'] += shift; e['dur'] -= shift
     return out
 
 def absorb_micro_rests(tiled):
-    """Remove rests too short to read as silence.
-
-    A sixteenth rest gets absorbed by the note next to it (the one before, if
-    possible). An odd-length rest, like a dotted eighth, gives one sixteenth to
-    a neighbor so both end up on even values. Even rests of an eighth or more
-    are real and stay. Neighbors never grow into a double-dotted length, so
-    this can't undo redistribute_double_dots()."""
     ev = [dict(e) for e in tiled]
-
     def same_bar(a, b): return a['on'] // U_PER_BAR == b['on'] // U_PER_BAR
     def tied(e): return e.get('tie_start') or e.get('tie_stop')
 
@@ -914,16 +703,16 @@ def absorb_micro_rests(tiled):
                       and same_bar(prv, e) and prv['on'] + prv['dur'] == e['on'])
             nxt_ok = (nxt is not None and nxt['kind'] == 'note' and not tied(nxt)
                       and same_bar(e, nxt) and e['on'] + e['dur'] == nxt['on'])
-            if e['dur'] == 1:                          # 16th rest -> absorbed entirely
+            if e['dur'] == 1:
                 if prv_ok and prv['dur'] + 1 in CLEAN_DURS:
                     prv['dur'] += 1; del ev[i]; changed = True; break
                 if nxt_ok and nxt['dur'] + 1 in CLEAN_DURS:
                     nxt['on'] -= 1; nxt['dur'] += 1; del ev[i]; changed = True; break
-                if prv_ok and prv['dur'] + 1 not in DD_FIX:     # fallback: not clean,
-                    prv['dur'] += 1; del ev[i]; changed = True; break   # but never 7/14
+                if prv_ok and prv['dur'] + 1 not in DD_FIX:
+                    prv['dur'] += 1; del ev[i]; changed = True; break
                 if nxt_ok and nxt['dur'] + 1 not in DD_FIX:
                     nxt['on'] -= 1; nxt['dur'] += 1; del ev[i]; changed = True; break
-            elif e['dur'] % 2 == 1:                    # odd rest -> give one 16th away
+            elif e['dur'] % 2 == 1:
                 if prv_ok and prv['dur'] % 2 == 1 and prv['dur'] + 1 not in DD_FIX:
                     prv['dur'] += 1; e['on'] += 1; e['dur'] -= 1; changed = True; break
                 if nxt_ok and nxt['dur'] % 2 == 1 and nxt['dur'] + 1 not in DD_FIX:
@@ -931,9 +720,6 @@ def absorb_micro_rests(tiled):
     return ev
 
 def even_out_snapped_pairs(tiled):
-    """Rewrite a beat split 1+3 or 3+1 (sixteenth + dotted eighth) as two
-    eighths. That split usually comes from two notes snapping to different
-    grids. Only touching, untied pairs in the same measure change."""
     ev = [dict(e) for e in tiled]
     for i in range(len(ev) - 1):
         a, b = ev[i], ev[i + 1]
@@ -943,16 +729,12 @@ def even_out_snapped_pairs(tiled):
         if (a.get('tie_start') or a.get('tie_stop')
                 or b.get('tie_start') or b.get('tie_stop')): continue
         if {a['dur'], b['dur']} == {1, 3}:
-            if a['dur'] == 1: b['on'] += 1   # a grows 1->2, so b starts one 16th later
-            else:             b['on'] -= 1   # a shrinks 3->2, so b starts one 16th earlier
+            if a['dur'] == 1: b['on'] += 1
+            else:             b['on'] -= 1
             a['dur'] = b['dur'] = 2
     return ev
 
 def measure_health(score):
-    """Check that every measure adds up to exactly four beats, with no gaps or
-    overlaps. An overlap plus a gap can still add up to 4, but MuseScore shows
-    it as a second voice padded with grey rests. Returns (part, measure,
-    problem) for each bad measure."""
     probs = []
     for p in score.parts:
         pname = (p.partName or "?")
@@ -969,13 +751,6 @@ def measure_health(score):
     return probs
 
 def _beat_mapper(beat_times):
-    """Return a seconds -> beat index function built on the tracked beats.
-
-    Converting with a fixed tempo assumes beat one is at 0:00. That's true for
-    a DAW export, but not for a recording with a count-in or a pickup, where
-    every note ends up shifted off the grid. Interpolating between tracked
-    beats fixes that and follows any tempo drift. Returns None if there are
-    fewer than two beats, and the caller falls back to the fixed tempo."""
     if beat_times is None: return None
     bt = np.asarray(beat_times, float)
     if len(bt) < 2: return None
@@ -990,22 +765,12 @@ def _beat_mapper(beat_times):
 
 def grand_staff_make(vocal_midi, chord_midi, out_xml, rng=None, beat_times=None,
                      tempo=None):
-    """Build the two-staff score from the melody and chord MIDI files.
-
-    Returns (path, key_name, tempo, n_bad_measures, score)."""
     cs = m21.converter.parse(chord_midi)
     key = cs.analyze('key')
 
-    # Read the melody with pretty_midi, not music21. music21 quantizes on
-    # import (to a mixed sixteenth/triplet grid) and rewrites overlaps, which
-    # would be a second, hidden quantization. pretty_midi gives times in
-    # seconds, so notes get rounded exactly once, below. A note that runs into
-    # the next attack is clipped there instead of dropped.
     vpm = pretty_midi.PrettyMIDI(vocal_midi)
     _vt, _vtempi = vpm.get_tempo_changes()
     bpm = float(tempo) if tempo else (float(_vtempi[0]) if len(_vtempi) else 128.0)
-    # Seconds -> sixteenth units. Uses the tracked beats when there are enough,
-    # and a fixed tempo otherwise.
     bmap = _beat_mapper(beat_times)
     def _u(t):
         if bmap is not None: return bmap(t) * U_PER_BEAT
@@ -1016,31 +781,28 @@ def grand_staff_make(vocal_midi, chord_midi, out_xml, rng=None, beat_times=None,
     for i, n in enumerate(raw):
         end = n.end
         if i + 1 < len(raw) and raw[i + 1].start < end:
-            end = raw[i + 1].start                       # clip at the next attack
+            end = raw[i + 1].start
         if end <= n.start: continue
         a = _u(n.start); b = _u(end)
-        if rng is not None:                              # seed: nudge before the grid snap
+        if rng is not None:
             a += rng.uniform(-SEED_MELODY_JITTER, SEED_MELODY_JITTER)
             b += rng.uniform(-SEED_MELODY_JITTER, SEED_MELODY_JITTER)
         on = int(round(a)); dur = max(1, int(round(b)) - on)
-        if on < 0: on = 0                                # pickup before the downbeat
+        if on < 0: on = 0
         vevents.append({'on': on, 'dur': dur, 'kind': 'note', 'payload': int(n.pitch)})
     vevents.sort(key=lambda e: e['on'])
 
-    # Cleanup passes, in order. Each one logs its note count, so the printed
-    # tally shows which pass removed a note.
     kt = [("mid", len(vevents))]
     def _kt(name, ev): kt.append((name, len(ev))); return ev
-    vevents = _kt("fold",   fold_octave_outliers_events(vevents))    # octave errors
-    vevents = _kt("trills", collapse_halfstep_trills(vevents, key))  # vibrato trills
-    vevents = _kt("blips",  collapse_chromatic_neighbors(vevents, key))  # pitch slides
-    vevents = _kt("consol", consolidate_melody(vevents))             # split notes
-    vevents = _kt("rhythm", clean_melody_rhythm(vevents))            # quantization
-    vevents = _kt("samepitch", merge_same_pitch_grid(vevents))       # post-grid splits
-    vevents = _kt("zigzag", declutter_zigzag_bars(vevents))          # spray bars
-    vevents = _kt("lift",   lift_low_treble_runs(vevents))           # register
+    vevents = _kt("fold",   fold_octave_outliers_events(vevents))
+    vevents = _kt("trills", collapse_halfstep_trills(vevents, key))
+    vevents = _kt("blips",  collapse_chromatic_neighbors(vevents, key))
+    vevents = _kt("consol", consolidate_melody(vevents))
+    vevents = _kt("rhythm", clean_melody_rhythm(vevents))
+    vevents = _kt("samepitch", merge_same_pitch_grid(vevents))
+    vevents = _kt("zigzag", declutter_zigzag_bars(vevents))
+    vevents = _kt("lift",   lift_low_treble_runs(vevents))
 
-    # Chords go through the same reader and grid, so both staves agree.
     cpm = pretty_midi.PrettyMIDI(chord_midi)
     cgroups = {}
     for i2 in cpm.instruments:
@@ -1055,7 +817,7 @@ def grand_staff_make(vocal_midi, chord_midi, out_xml, rng=None, beat_times=None,
         craw.append({'on': on, 'dur': max(CHORD_SNAP_UNITS, end - on),
                      'kind': 'chord', 'payload': compact_triad([n2.pitch for n2 in grp])})
     cevents = merge_identical(craw)
-    cevents = drop_bass_collisions(cevents, vevents)    # on a collision the left hand moves
+    cevents = drop_bass_collisions(cevents, vevents)
 
     total_u = max([e['on']+e['dur'] for e in vevents+cevents] + [U_PER_BAR])
     total_u = ((total_u + U_PER_BAR - 1)//U_PER_BAR)*U_PER_BAR
@@ -1066,10 +828,10 @@ def grand_staff_make(vocal_midi, chord_midi, out_xml, rng=None, beat_times=None,
 
     pc_map = build_spelling(key)
     vt = tile_voice(vevents, total_u, legato=LEGATO_FILL_UNITS)
-    vt = absorb_micro_rests(vt)         # sixteenth and odd-length rests
-    vt = even_out_snapped_pairs(vt)     # unevenly split beats
-    vt = redistribute_double_dots(vt)   # double dots, including any just created
-    vt = absorb_micro_rests(vt)         # again, for odd rests the last step left
+    vt = absorb_micro_rests(vt)
+    vt = even_out_snapped_pairs(vt)
+    vt = redistribute_double_dots(vt)
+    vt = absorb_micro_rests(vt)
     ct = tile_voice(cevents, total_u, legato=0)
     score = m21.stream.Score()
     score.insert(0, build_part(vt, total_u, m21.clef.TrebleClef(), key, m21.meter.TimeSignature('4/4'),"Right Hand", pc_map, tempo=bpm))
@@ -1087,12 +849,8 @@ def grand_staff_make(vocal_midi, chord_midi, out_xml, rng=None, beat_times=None,
     return out_xml, key.name, bpm, len(probs), score
 
 
-# ============================================================================
-# STAGE 0: stem separation
-# ============================================================================
+# stage 0 demucs
 def run_demucs(input_audio):
-    """Split the song into vocals, bass, drums, and other with Demucs. Skipped
-    if the stems already exist. Returns (stem_dir, song_name)."""
     song = os.path.splitext(os.path.basename(input_audio))[0]
     stem_dir = os.path.join(STEM_ROOT, DEMUCS_MODEL, song)
     needed = ["vocals.wav", "bass.wav", "drums.wav", "other.wav"]
@@ -1103,7 +861,7 @@ def run_demucs(input_audio):
         raise FileNotFoundError(f"input audio not found: {input_audio}")
     cmd = ["demucs", "-n", DEMUCS_MODEL, "-o", STEM_ROOT, input_audio]
     print(f"   {' '.join(cmd)}")
-    r = subprocess.run(cmd)                       # let Demucs print its own progress
+    r = subprocess.run(cmd)
     if r.returncode != 0:
         raise RuntimeError("Demucs failed (see output above)")
     missing = [s for s in needed if not os.path.exists(os.path.join(stem_dir, s))]
@@ -1112,12 +870,8 @@ def run_demucs(input_audio):
     return stem_dir, song
 
 
-# ============================================================================
-# STAGE 1: accompaniment mixdown
-# ============================================================================
+# stage 1 accompaniment mix
 def run_accompaniment(stem_dir, out_wav):
-    """Mix the three non-vocal stems into one file. Beat tracking runs on this
-    instead of the full mix, so the vocal doesn't pull the grid around."""
     bass, _  = librosa.load(os.path.join(stem_dir, "bass.wav"),  sr=SR, mono=True)
     drums, _ = librosa.load(os.path.join(stem_dir, "drums.wav"), sr=SR, mono=True)
     other, _ = librosa.load(os.path.join(stem_dir, "other.wav"), sr=SR, mono=True)
@@ -1128,35 +882,21 @@ def run_accompaniment(stem_dir, out_wav):
     print(f"   {out_wav}  ({m/SR:.1f}s)")
 
 
-# ============================================================================
-# STAGE 2: tempo and beat grid
-# ============================================================================
+# stage 2 beats
 def fit_uniform_grid(beat_times, tol=GRID_FIT_TOL, need=GRID_FIT_COVERAGE):
-    """Rebuild the beat grid from one steady pulse, if one pulse fits.
-
-    For a song with a fixed tempo, the tracked beats are a noisy sample of a
-    perfectly regular grid, with some beats missing where the pulse was weak.
-    Each tracked beat votes for the period that would put it on a grid line (a
-    missing beat just doesn't vote), the best period and phase are refined with
-    least squares, and the full grid is rebuilt from them. This works the same
-    whether the dropouts are spread out or bunched in one quiet section. If
-    fewer than `need` of the beats land on the grid, the tempo really moves and
-    the tracked times are returned unchanged.
-
-    Returns (beat_times, fit_used, coverage, tempo_bpm)."""
     bt = np.asarray(beat_times, float)
     if len(bt) < 16:
         return bt, False, 0.0, 0.0
     iv = np.diff(bt)
-    seed = float(np.percentile(iv, 20))   # dropouts only make intervals longer, so the
-    if seed <= 1e-6:                      # 20th percentile sits close to the real beat
+    seed = float(np.percentile(iv, 20))
+    if seed <= 1e-6:
         return bt, False, 0.0, 0.0
     cand = np.linspace(0.85 * seed, 1.25 * seed, 4000)
     votes = np.exp(2j * np.pi * bt[None, :] / cand[:, None]).mean(axis=1)
     best = int(np.argmax(np.abs(votes)))
     tau = float(cand[best])
     phase = float(np.angle(votes[best]) / (2 * np.pi) * tau)
-    for _ in range(3):                    # snap to lines, refit, repeat
+    for _ in range(3):
         k = np.round((bt - phase) / tau)
         A = np.vstack([k, np.ones_like(k)]).T
         tau, phase = np.linalg.lstsq(A, bt, rcond=None)[0]
@@ -1167,23 +907,12 @@ def fit_uniform_grid(beat_times, tol=GRID_FIT_TOL, need=GRID_FIT_COVERAGE):
     coverage = float(np.mean(np.abs(bt - (phase + k * tau)) <= tol * tau))
     if coverage < need:
         return bt, False, coverage, 60.0 / tau
-    # Start and end on the grid lines nearest the first and last tracked beats.
     k0 = int(round((bt[0] - phase) / tau))
     k1 = int(round((bt[-1] - phase) / tau))
     return phase + np.arange(k0, k1 + 1) * tau, True, coverage, 60.0 / tau
 
 
 def repair_beat_grid(beat_times, tol=BEAT_GAP_TOL, win=BEAT_LOCAL_WIN):
-    """Fill in beats the tracker skipped, one gap at a time.
-
-    An interval close to a whole number of local beats is a dropout and gets
-    filled with evenly spaced beats. The local beat is a median of nearby
-    intervals, so a real tempo change is followed, not corrected. This is the
-    fallback when fit_uniform_grid() finds no single pulse. It handles changing
-    tempo, but it gets worse when several dropouts are bunched together, since
-    they stretch the local median too.
-
-    Returns (beat_times, beats_inserted)."""
     bt = np.asarray(beat_times, float)
     if len(bt) < 4:
         return bt, 0
@@ -1203,16 +932,6 @@ def repair_beat_grid(beat_times, tol=BEAT_GAP_TOL, win=BEAT_LOCAL_WIN):
 
 
 def regularize_beat_grid(beat_times, max_dev=BEAT_STEADY_MAX, rms_dev=BEAT_STEADY_RMS):
-    """Swap the tracked beats for a straight line when the tempo is fixed.
-
-    Tracked beats are off by a few tens of milliseconds, which is a real chunk
-    of a sixteenth and can push a note into the wrong cell. If the beats
-    already sit close to a line (a DAW export, or a band playing to a click),
-    that scatter is noise and the line is the better grid. If the tempo
-    actually moves, the test fails and the beats are left alone.
-
-    Returns (beat_times, line_used, rms_deviation, max_deviation), with
-    the deviations in beats."""
     bt = np.asarray(beat_times, float)
     if len(bt) < 8:
         return bt, False, 0.0, 0.0
@@ -1229,17 +948,6 @@ def regularize_beat_grid(beat_times, max_dev=BEAT_STEADY_MAX, rms_dev=BEAT_STEAD
 
 
 def detect_tempo_and_beats(accomp_wav, cache_npz=None):
-    """Find the tempo and every beat position, once per song.
-
-    Uses madmom's RNN beat tracker, then librosa, then a fixed 120 BPM grid if
-    both fail. The melody and chord stages share the result so they can't
-    disagree on tempo, and it's cached so reruns and seeded variants skip it.
-    The grid is then repaired (see _finish_beats) and the tempo is measured
-    from the repaired grid.
-
-    Returns (tempo_bpm, beat_times_sec, grid_changed). grid_changed is True
-    when the repair changed a cached grid, so the caller knows to rebuild what
-    was built on the old one."""
     if cache_npz and os.path.exists(cache_npz):
         c = np.load(cache_npz, allow_pickle=True)
         if "repair" in c.files and int(c["repair"]) == BEAT_REPAIR_VERSION:
@@ -1272,7 +980,6 @@ def detect_tempo_and_beats(accomp_wav, cache_npz=None):
 
 
 def _finish_beats(beat_times, cache_npz=None, was_cached=False):
-    """Repair, straighten, and cache a beat grid, and print what changed."""
     before = len(beat_times)
     grid, fitted, coverage, fit_bpm = fit_uniform_grid(beat_times)
     if fitted:
@@ -1304,16 +1011,8 @@ def _finish_beats(beat_times, cache_npz=None, was_cached=False):
     return tempo, beat_times, (was_cached and changed)
 
 
-# ============================================================================
-# STAGE 3: pitch contour
-# ============================================================================
+# stage 3 crepe
 def run_crepe(vocals_wav, cache_npz):
-    """Track the vocal pitch frame by frame with CREPE.
-
-    This is the slowest stage, so the result is cached per song and reused
-    unless the model, hop size, or vocals.wav changes.
-
-    Returns (times, f0_hz, confidence)."""
     import torch, torchcrepe
     src_mtime = os.path.getmtime(vocals_wav)
     if os.path.exists(cache_npz):
@@ -1323,7 +1022,7 @@ def run_crepe(vocals_wav, cache_npz):
             print(f"   loaded cached CREPE ({len(c['f0'])} frames)")
             return c["times"], c["f0"], c["conf"]
     vocals, _ = librosa.load(vocals_wav, sr=SR, mono=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"   # the GPU when there is one
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     chunk = SR * CREPE_CHUNK_SEC
     n = int(np.ceil(len(vocals) / chunk))
     f0a, cfa = [], []
@@ -1344,20 +1043,14 @@ def run_crepe(vocals_wav, cache_npz):
     return times, f0, conf
 
 
-# ============================================================================
-# STAGE 4: vocal note extraction
-# ============================================================================
+# stage 4 vocal notes
 def aligned_rms(vocals, n_frames):
-    """Vocal loudness on the same frames as the pitch contour, padded or
-    trimmed so both arrays line up."""
     rms = librosa.feature.rms(y=vocals, frame_length=HOP * 4, hop_length=HOP)[0]
     if len(rms) < n_frames:
         rms = np.pad(rms, (0, n_frames - len(rms)), mode='edge')
     return rms[:n_frames]
 
 def run_vocals(vocals_wav, cache_npz, out_midi, tempo):
-    """Vocal stem -> MIDI melody: track pitch, split it into notes, fix octave
-    errors, and drop anything outside singing range."""
     times, f0, conf = run_crepe(vocals_wav, cache_npz)
     vocals, _ = librosa.load(vocals_wav, sr=SR, mono=True)
     rms = aligned_rms(vocals, len(f0))
@@ -1383,15 +1076,8 @@ def run_vocals(vocals_wav, cache_npz, out_midi, tempo):
     return len(kept)
 
 
-# ============================================================================
-# STAGE 6: sustained note tails
-# ============================================================================
+# stage 6 note tails
 def run_extend(in_midi, vocals_wav, out_midi):
-    """Close gaps inside notes the singer was still holding.
-
-    If the vocal energy between two notes stays above EXT_HOLD_FRAC of a normal
-    note, the singer never stopped, so the first note is extended to the next
-    one. Gaps longer than EXT_MAX_FILL_SEC stay as they are."""
     y, _  = librosa.load(vocals_wav, sr=SR, mono=True)
     rms   = librosa.feature.rms(y=y, frame_length=HOP * 4, hop_length=HOP)[0]
     t_rms = librosa.frames_to_time(np.arange(len(rms)), sr=SR, hop_length=HOP)
@@ -1417,16 +1103,8 @@ def run_extend(in_midi, vocals_wav, out_midi):
     print(f"   extended {extended} clipped notes -> {out_midi}")
 
 
-# ============================================================================
-# STAGE 8: chord extraction
-# ============================================================================
+# stage 8 chords
 def run_chords(bass_wav, other_wav, accomp_wav, out_midi, out_txt, tempo, beat_times):
-    """Find the chord on each beat and write the result as MIDI.
-
-    Chroma from other.wav gives the harmony and chroma from bass.wav gives the
-    root. Same-chord beats are merged into blocks, stray off-key blocks are
-    fixed, and block edges snap to the sixteenth grid. A text file lists the
-    blocks as start,end,chord so they're easy to check."""
     bass, _  = librosa.load(bass_wav,  sr=SR, mono=True)
     other, _ = librosa.load(other_wav, sr=SR, mono=True)
     lens = [len(bass), len(other)]
@@ -1496,42 +1174,28 @@ def run_chords(bass_wav, other_wav, accomp_wav, out_midi, out_txt, tempo, beat_t
     print(f"   {len(merged)} chord blocks | diatonic guard fixed {chd_fixed} stray -> {out_midi}  (stamped {clean_tempo} BPM)")
 
 
-# ============================================================================
-# MELODIC LINE EXTRACTION
-#
-# Basic Pitch returns every note it hears, including inner voices, pads, and
-# octave ghosts. The functions below pick one melody line out of that pool:
-# each note is scored on loudness and prominence, and dynamic programming finds
-# the best connected path, favoring small leaps and short gaps. Stages 5 and 7
-# both use it.
-# ============================================================================
+# basic pitch melody line
 from scipy.signal import stft, resample_poly
 
-CONF_FLOOR   = 0.25   # lowest confidence let into the pool. Kept low on purpose,
-                      # since the path search does the filtering.
-MIN_DUR      = 0.08   # discard candidates shorter than 80 ms
-MELODY_FLOOR = 48     # C3. Notes below this never enter the search (raise it
-                      # if low pads still leak into the line)
-W_PITCH      = 0.40   # path cost per octave of pitch movement between two notes
-W_GAP        = 0.30   # path cost per second of silence bridged, capped at GAP_CAP
+CONF_FLOOR   = 0.25
+MIN_DUR      = 0.08
+MELODY_FLOOR = 48
+W_PITCH      = 0.40
+W_GAP        = 0.30
 GAP_CAP      = 1.0
-MAX_LINK_SEC = 8.0    # never bridge a gap longer than this
-NOTE_COST    = 0.10   # flat cost per note, which favors sparser lines
-REG_BONUS    = 0.20   # reward for sitting above the local register, capped at an
-REG_WIN      = 3.0    # octave and measured over this many seconds
-OVERLAP_TOL  = 0.15   # a note may begin this long before the previous one ends
-W_SAL        = 0.60   # weight of measured loudness against transcriber amplitude
-GHOST_W      = 0.50   # penalty for energy an octave below a note (a sign the
-                      # note is really an overtone of the lower one)
-SAL_LOCAL    = 0.50   # weight of local prominence against overall loudness rank
-SAL_SR       = 16000  # loudness analysis is done at this rate
-SAL_NFFT     = 4096   # about 3.9 Hz per bin, enough to resolve a semitone at C3
-SAL_HOP      = 512    # 32 ms frames
+MAX_LINK_SEC = 8.0
+NOTE_COST    = 0.10
+REG_BONUS    = 0.20
+REG_WIN      = 3.0
+OVERLAP_TOL  = 0.15
+W_SAL        = 0.60
+GHOST_W      = 0.50
+SAL_LOCAL    = 0.50
+SAL_SR       = 16000
+SAL_NFFT     = 4096
+SAL_HOP      = 512
 
 def run_basic_pitch(other_wav, cache_npz):
-    """Run Basic Pitch on one stem, cached against the file's timestamp.
-
-    Returns [(start_sec, end_sec, midi_pitch, amplitude), ...]."""
     if os.path.exists(cache_npz):
         c = np.load(cache_npz)
         if float(c['mtime']) == os.path.getmtime(other_wav):
@@ -1550,10 +1214,6 @@ def run_basic_pitch(other_wav, cache_npz):
     return notes
 
 def _salience_core(y, sr, notes):
-    """How much energy each note actually has in the audio: the spectrum in a
-    half-semitone band around its pitch, plus half the energy at its octave,
-    minus a penalty for energy an octave below (which means it's probably an
-    overtone of a lower note)."""
     if sr != SAL_SR:
         g = int(np.gcd(int(sr), SAL_SR))
         y = resample_poly(y, SAL_SR // g, int(sr) // g)
@@ -1578,8 +1238,6 @@ def _salience_core(y, sr, notes):
         if 2 * f0 < f[-1]:
             l2, h2 = band(2 * f0)
             v += 0.5 * S[l2:h2, i0:i1].sum(axis=0).mean()
-        # Octave-ghost penalty: a fake note detected an octave above a real one
-        # has a lot of energy at f0/2.
         if f0 / 2 > f[1]:
             l0, h0 = band(f0 / 2)
             v -= GHOST_W * S[l0:h0, i0:i1].sum(axis=0).mean()
@@ -1587,8 +1245,6 @@ def _salience_core(y, sr, notes):
     return raw
 
 def _local_dominance(notes, raw):
-    """Each note's loudness divided by the loudest note playing at the same
-    time. A melody note usually stands out from the accompaniment under it."""
     n = len(notes)
     starts = np.array([x[0] for x in notes]); ends = np.array([x[1] for x in notes])
     order = np.argsort(starts)
@@ -1610,8 +1266,6 @@ def _local_dominance(notes, raw):
     return dom
 
 def salience_from_audio(y, sr, notes):
-    """Per-note prominence from 0 to 1, a mix of overall loudness rank and
-    local dominance (SAL_LOCAL sets the mix)."""
     raw = _salience_core(y, sr, notes)
     global_rank = np.argsort(np.argsort(raw)) / max(len(notes) - 1, 1)
     dom = _local_dominance(notes, raw)
@@ -1624,8 +1278,6 @@ def note_salience(other_wav, notes):
     return salience_from_audio(np.asarray(y, float), sr, notes)
 
 def fold_octave_outliers(line, window=5, jump=11):
-    """Move notes `jump` or more semitones from the local median back by whole
-    octaves. Nothing is deleted and no pitch class changes."""
     if len(line) < 3: return line
     p = np.array([x[2] for x in line], float)
     center = np.array([np.median(p[max(0, k - window):min(len(p), k + window + 1)])
@@ -1640,13 +1292,6 @@ def fold_octave_outliers(line, window=5, jump=11):
     return out
 
 def dp_melody(notes, salience=None):
-    """Pick the most likely melody line out of a pool of candidate notes.
-
-    Each note gets a reward from its loudness, prominence, and register
-    compared to its neighbors. Dynamic programming then finds the best chain of
-    non-overlapping notes, charging for big leaps and long silences, so the
-    result is a connected line instead of just the loudest notes.
-    Returns [(start, end, pitch), ...]."""
     pool = [(k, n) for k, n in enumerate(notes)
             if n[3] >= CONF_FLOOR and (n[1] - n[0]) >= MIN_DUR and n[2] >= MELODY_FLOOR]
     if not pool:
@@ -1669,7 +1314,7 @@ def dp_melody(notes, salience=None):
         return amp + REG_BONUS * reg - NOTE_COST
 
     n = len(cand)
-    score = [reward(k) for k in range(n)]     # best path ending at k (starts as k alone)
+    score = [reward(k) for k in range(n)]
     prev  = [-1] * n
     lookback = MAX_LINK_SEC + max(e - s for (s, e, _, _) in cand)
     for i in range(n):
@@ -1697,18 +1342,8 @@ def dp_melody(notes, salience=None):
     return fold_octave_outliers(out)
 
 
-# ============================================================================
-# STAGE 5: vocal recovery
-#
-# CREPE follows one voice at a time. With stacked harmony vocals it jumps
-# between them, and when it loses the voice it outputs nothing. Those notes
-# never make it into the MIDI, so no later stage can fix them. This stage runs
-# Basic Pitch on the vocal stem, pulls one melody line out of it, and uses that
-# line to replace unreliable stretches and fill gaps, but only where someone is
-# actually singing.
-# ============================================================================
+# stage 5 basic pitch recovery
 def _merge_spans(regs):
-    """Merge overlapping (start, end) spans."""
     out = []
     for r0, r1 in sorted(regs):
         if out and r0 <= out[-1][1] + 1e-9:
@@ -1718,10 +1353,6 @@ def _merge_spans(regs):
     return out
 
 def _thin_region(vnotes, r0, r1, beat_sec):
-    """Thin an unreliable region that the extracted line can't cover: keep the
-    longest note in each beat and drop the rest. That leaves a sparse outline
-    instead of a spray or an empty bar.
-    Returns (notes, count_before, count_after)."""
     inside = [n for n in vnotes if r0 <= (n[0] + n[1]) / 2 < r1]
     if not inside: return vnotes, 0, 0
     keep = []
@@ -1735,12 +1366,6 @@ def _thin_region(vnotes, r0, r1, beat_sec):
     return out, len(inside), len(keep)
 
 def _low_conf_regions(t, conf, bpm, thresh=None, min_beats=None):
-    """Find stretches where CREPE was guessing.
-
-    Confidence is averaged per beat, and runs of at least `min_beats`
-    beats below `thresh` are returned. Only voiced frames count, so a
-    quiet or sparse passage doesn't look unreliable just because most of
-    its frames have no pitch."""
     if thresh is None: thresh = VPATCH_CONF
     if min_beats is None: min_beats = VPATCH_MIN_BEATS
     t = np.asarray(t, float); conf = np.asarray(conf, float)
@@ -1751,10 +1376,10 @@ def _low_conf_regions(t, conf, bpm, thresh=None, min_beats=None):
     for k in range(nb):
         m = (t >= k * beat) & (t < (k + 1) * beat)
         voiced = m & (conf >= thresh)
-        if voiced.any():                       # judge the beat on its voiced frames
+        if voiced.any():
             means.append(float(conf[voiced].mean()))
-        elif m.any():                          # nothing voiced at all: the tracker
-            means.append(float(conf[m].mean()))  # found no line to be unsure about
+        elif m.any():
+            means.append(float(conf[m].mean()))
         else:
             means.append(1.0)
     regs, k = [], 0
@@ -1770,13 +1395,6 @@ def _low_conf_regions(t, conf, bpm, thresh=None, min_beats=None):
     return regs
 
 def _replace_regions(vnotes, line, regions, min_cover=0.4):
-    """Swap the extracted line in for CREPE's notes, one region at a time.
-
-    A region only gets replaced if the line covers at least `min_cover` of it;
-    otherwise it's left alone instead of emptied. Old notes are kept or
-    removed by their midpoint, and new notes are clipped to the region.
-    Returns (notes, replaced), where each entry of `replaced` is (start, end,
-    n_removed, n_inserted)."""
     out = list(vnotes); swapped = []
     for (r0, r1) in regions:
         cand = []
@@ -1792,16 +1410,6 @@ def _replace_regions(vnotes, line, regions, min_cover=0.4):
     return out, swapped
 
 def _patch_holes(vnotes, line, gate_sec, song_end, is_vocal=None):
-    """Fill gaps in the vocal line from the extracted line.
-
-    Any gap of at least `gate_sec` (including before the first note) is a
-    candidate, and new notes are clipped to the gap so existing notes never
-    change. `is_vocal(start, end)` decides if a gap belongs here at all. Where
-    nobody is singing, the vocal stem only has bleed, and filling the gap would
-    write wrong notes and hide it from stage 7. Those gaps are reported and
-    left open. With is_vocal=None, every gap is filled.
-
-    Returns (holes, added, skipped)."""
     holes, skipped = [], []
     if vnotes:
         if vnotes[0][0] >= gate_sec: holes.append((0.0, vnotes[0][0]))
@@ -1824,14 +1432,6 @@ def _patch_holes(vnotes, line, gate_sec, song_end, is_vocal=None):
 
 
 def vocal_presence(vocals_wav, other_wav=None):
-    """Build a test for whether someone is actually singing over a time span.
-
-    Returns a function (start, end) -> bool, or None if the audio can't be read
-    (then every span counts as sung). A span counts as sung if the vocal stem
-    reaches its own normal singing level often enough and, when other.wav is
-    given, isn't far quieter than the instruments. The first check rejects
-    silence. The second rejects bleed, which can be loud in a loud section but
-    stays far below the instruments it leaked from."""
     try:
         yv, _ = librosa.load(vocals_wav, sr=SR, mono=True)
         rv = librosa.feature.rms(y=yv, frame_length=HOP * 4, hop_length=HOP)[0]
@@ -1839,7 +1439,7 @@ def vocal_presence(vocals_wav, other_wav=None):
     except Exception as ex:
         print(f"   vocal presence test unavailable ({ex}) -> every span treated as sung")
         return None
-    loud = rv[rv > np.median(rv)]                 # the stem's own singing level
+    loud = rv[rv > np.median(rv)]
     floor = float(np.median(loud)) * VOCAL_FLOOR_FRAC if len(loud) else 0.0
     ro = to = None
     if other_wav and os.path.isfile(other_wav):
@@ -1866,14 +1466,6 @@ def vocal_presence(vocals_wav, other_wav=None):
 
 def run_vocal_patch(in_mid, vocals_wav, bp_cache_v, out_mid, crepe_npz=None,
                     other_wav=None):
-    """Recover vocal notes CREPE couldn't resolve (stage 5).
-
-    Runs Basic Pitch on vocals.wav and pulls one melody line out of it. That
-    line replaces stretches where CREPE's confidence shows it was jumping
-    between stacked voices, and fills gaps where it lost the voice. Both only
-    happen where the vocal stem shows someone singing, so instrumental sections
-    are left for stage 7. Notes outside the replaced or thinned regions never
-    change, and if anything fails the input passes through unchanged."""
     import shutil
     def passthrough(msg):
         print(f"   {msg} -> vocals passed through unpatched")
@@ -1893,8 +1485,6 @@ def run_vocal_patch(in_mid, vocals_wav, bp_cache_v, out_mid, crepe_npz=None,
         line = dp_melody(notes, sal)
     except Exception as ex:
         return passthrough(f"vocal-patch transcription failed ({ex})")
-    # Where CREPE's confidence stays low for a while, swap in the extracted
-    # line (if it covers the region).
     regions, swapped = [], []
     if crepe_npz and os.path.exists(crepe_npz):
         try:
@@ -1910,7 +1500,6 @@ def run_vocal_patch(in_mid, vocals_wav, bp_cache_v, out_mid, crepe_npz=None,
             print(f"   confidence scan skipped ({ex})")
     regions = _merge_spans(list(regions))
 
-    # Only edit spans where someone is actually singing.
     is_vocal = vocal_presence(vocals_wav, other_wav)
     if is_vocal is not None and regions:
         sung = [r for r in regions if is_vocal(*r)]
@@ -1923,8 +1512,8 @@ def run_vocal_patch(in_mid, vocals_wav, bp_cache_v, out_mid, crepe_npz=None,
         print(f"   {r0:.1f}-{r1:.1f}s: replaced {rem} note(s) with {ins} from vocals.wav")
     swapped_starts = {round(a, 6) for a, _, _, _ in swapped}
     thinned = []
-    for (r0, r1) in regions:                             # regions the line couldn't cover:
-        if round(r0, 6) in swapped_starts: continue      # thin them to a sparse outline
+    for (r0, r1) in regions:
+        if round(r0, 6) in swapped_starts: continue
         vnotes, n_in, n_keep = _thin_region(vnotes, r0, r1, 60.0 / bpm)
         if n_in > n_keep:
             thinned.append((r0, r1))
@@ -1954,20 +1543,8 @@ def run_vocal_patch(in_mid, vocals_wav, bp_cache_v, out_mid, crepe_npz=None,
     print(f"   {len(swapped)} region(s) replaced | {len(holes)} vocal gap(s)"
           f"{f' (longest {big:.1f}s)' if holes else ''} | +{len(added)} note(s) -> {out_mid}")
 
-# ============================================================================
-# STAGE 7: instrumental fill
-# ============================================================================
+# stage 7 instrumental fill
 def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
-    """Fill vocal rests with the instrumental melody (stage 7).
-
-    Rests come from the extended vocal line, so they're real silences and not
-    gaps inside held notes. A rest of at least FILL_GATE_BEATS with at least
-    FILL_MIN_NOTES instrumental notes in it gets filled from the melody line
-    pulled out of other.wav. A rest with fewer notes stays a rest. If a
-    lead.wav sits next to the stems, it's used instead of other.wav. The
-    full-song instrumental line also goes to `dp_mid` so you can listen to it
-    alone. Vocal notes never change, added notes are clipped at the end of
-    their rest, and if anything fails the input passes through unfilled."""
     import shutil
     def passthrough(msg):
         print(f"   {msg} -> vocals passed through unfilled")
@@ -1981,7 +1558,7 @@ def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
 
     rests = []
     if vnotes and vnotes[0].start >= gate:
-        rests.append((0.0, vnotes[0].start))                 # before the first entry
+        rests.append((0.0, vnotes[0].start))
     for i in range(len(vnotes) - 1):
         g0, g1 = vnotes[i].end, vnotes[i + 1].start
         if g1 - g0 >= gate:
@@ -2004,7 +1581,7 @@ def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
         line = dp_melody(notes, sal)
     except Exception as ex:
         return passthrough(f"instrumental transcription failed ({ex})")
-    if dp_mid and line:                       # full-song line, to listen to on its own
+    if dp_mid and line:
         dpm = pretty_midi.PrettyMIDI(initial_tempo=int(round(bpm)))
         dpm.time_signature_changes.append(pretty_midi.TimeSignature(4, 4, 0.0))
         di = pretty_midi.Instrument(program=0, name="Instrumental melody")
@@ -2014,7 +1591,7 @@ def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
         dpm.instruments.append(di)
         dpm.write(dp_mid)
         print(f"   full-song instrumental line -> {dp_mid}")
-    if line:                                                  # and after the last one
+    if line:
         tail0, tail1 = vnotes[-1].end, line[-1][1]
         if tail1 - tail0 >= gate:
             rests.append((tail0, tail1))
@@ -2025,7 +1602,7 @@ def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
         seg = [(s, min(e, b), p) for (s, e, p) in line if a <= s < b]
         seg = [(s, e, p) for (s, e, p) in seg if e - s >= 0.08]
         if len(seg) < FILL_MIN_NOTES:
-            continue                                          # not a melodic line
+            continue
         for (s, e, p) in seg:
             inst.notes.append(pretty_midi.Note(velocity=85, pitch=int(max(0, min(127, p))),
                                                start=float(s), end=float(e)))
@@ -2034,27 +1611,17 @@ def run_rest_fill(in_mid, other_wav, bp_cache, out_mid, dp_mid=None):
     print(f"   {len(rests)} gated rest(s) | filled {filled} with {added} melody notes -> {out_mid}")
 
 
-# ============================================================================
-# ACCOMPANIMENT TEXTURES
-#
-# Written as scale degrees of the chord: 1 and 5 are the root and fifth an
-# octave down, 8 is the root, 9 the ninth, 10 the third, and 12 the fifth.
-# Each builder returns [(beat_offset, duration, [pitches]), ...].
-# ============================================================================
+# left hand patterns
 BLOCK_VARIANTS = {"inv1", "inv2", "open5", "oct158"}
 
 def acc_block_pitches(name, r, t, f):
-    """Other voicings for a held block chord (calm sections). Only the pitches
-    change; rhythm and ties stay."""
-    if name == "inv1":   return [t.transpose(-12), f.transpose(-12), r]   # first inversion
-    if name == "inv2":   return [f.transpose(-12), r, t]                  # second inversion
-    if name == "open5":  return [r, f]                                    # open fifth
-    if name == "oct158": return [r.transpose(-12), f.transpose(-12), r]   # low octave
-    return [r, t, f]                                                      # root position
+    if name == "inv1":   return [t.transpose(-12), f.transpose(-12), r]
+    if name == "inv2":   return [f.transpose(-12), r, t]
+    if name == "open5":  return [r, f]
+    if name == "oct158": return [r.transpose(-12), f.transpose(-12), r]
+    return [r, t, f]
 
 def _tile4(template, beats):
-    """Repeat a four-beat figure to fill `beats`, cutting off
-    whatever runs past the end."""
     out, base = [], 0.0
     while base < beats - 1e-9:
         for rel, ql, ps in template:
@@ -2065,42 +1632,31 @@ def _tile4(template, beats):
     return out
 
 def acc_build(pat, beats, r, t, f):
-    """Lay out one accompaniment texture over a chord that lasts `beats` beats,
-    given its root, third, and fifth."""
     nb = int(round(beats))
     r_lo, f_lo = r.transpose(-12), f.transpose(-12)
-    if pat == "pulse":                          # root on every beat
+    if pat == "pulse":
         return [(float(i), 1.0, [r]) for i in range(nb)]
-    if pat == "asc_ninth":                      # rising 1-5-8-9, third held
+    if pat == "asc_ninth":
         ninth = r.transpose(2)
         return _tile4([(0.0, 0.5, [r_lo]), (0.5, 0.5, [f_lo]), (1.0, 0.5, [r]),
                        (1.5, 0.5, [ninth]), (2.0, 2.0, [t])], beats)
-    if pat == "asc_twelfth":                    # rising 1-5-8-10, fifth held
+    if pat == "asc_twelfth":
         return _tile4([(0.0, 0.5, [r_lo]), (0.5, 0.5, [f_lo]), (1.0, 0.5, [r]),
                        (1.5, 0.5, [t]), (2.0, 2.0, [f])], beats)
-    if pat == "climb":                          # 1-5-8-5-10-5-8-5
+    if pat == "climb":
         cell = [r_lo, f_lo, r, f_lo, t, f_lo, r, f_lo]
         return [(i*0.5, 0.5, [cell[i % len(cell)]]) for i in range(int(round(beats*2)))]
-    if pat == "updown":                         # arch: 1-5-8-10-8-5-1-5
+    if pat == "updown":
         cell = [r_lo, f_lo, r, t, r, f_lo, r_lo, f_lo]
         return [(i*0.5, 0.5, [cell[i % len(cell)]]) for i in range(int(round(beats*2)))]
-    if pat == "pump":                           # alternating root and fifth-plus-root
+    if pat == "pump":
         return [(i*0.5, 0.5, [r_lo] if i % 2 == 0 else [f_lo, r])
                 for i in range(int(round(beats*2)))]
-    return [(0.0, float(beats), [r, t, f])]     # sustained block chord
+    return [(0.0, float(beats), [r, t, f])]
 
 
-# ============================================================================
-# STAGE 10: left-hand rests
-# ============================================================================
+# stage 10 left hand rests
 def run_bass_silence(xml_in, xml_out, bass_wav, other_wav):
-    """Turn left-hand chords into rests where the music is silent (stage 10).
-
-    The chord detector puts a chord on every beat, even where nothing is
-    playing, so intros, breaks, and outros get chords nobody plays. Each chord
-    is checked against the energy in bass.wav and other.wav, and a run of dead
-    chords lasting at least SIL_GATE_BEATS becomes rests. A second pass removes
-    chords of one beat or less stuck between rests."""
     score = m21.converter.parse(xml_in)
     tm = score.flatten().getElementsByClass(m21.tempo.MetronomeMark)
     bpm = float(tm[0].number) if tm else 128.0
@@ -2154,8 +1710,6 @@ def run_bass_silence(xml_in, xml_out, bass_wav, other_wav):
                 it['sil'] = True
                 silenced.append(it)
 
-    # Second pass: a run of live chords that lasts one beat or less is stuck
-    # between rests, so it becomes a rest too.
     blips = 0
     live_runs, cur = [], []
     for it in items:
@@ -2199,17 +1753,8 @@ def run_bass_silence(xml_in, xml_out, bass_wav, other_wav):
         print(f"   !! {pn} measure {mn}: {why}")
 
 
-# ============================================================================
-# STAGE 11: accompaniment texture
-# ============================================================================
+# stage 11 left hand texture
 def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
-    """Replace held left-hand chords with a played accompaniment (stage 11).
-
-    Drum activity is measured and smoothed across the song, and each chord goes
-    in a calm, medium, or busy tier by where it falls (split at the 33rd and
-    66th percentiles). Calm gets held voicings, medium gets a pulse or rising
-    figure, and busy gets running eighths. The texture is picked once per
-    section, not per chord, and the last chord always ends on a held block."""
     score = m21.converter.parse(xml_in)
     tm = score.flatten().getElementsByClass(m21.tempo.MetronomeMark)
     bpm = float(tm[0].number) if tm else 128.0
@@ -2276,11 +1821,6 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
             merged.append(lc)
     logicals = merged
 
-    # Absorb orphan chords: a chord of one beat or less that matches neither
-    # neighbor is a detection error, not a chord change. If it touches the
-    # chord before it, it takes that chord's notes and merges into it. If a
-    # rest comes before it but it touches the next chord, it takes the next
-    # chord's notes instead and becomes an early start of that chord.
     def _reharmonize(parts, pitches):
         for part in parts:
             el = part['el']; meas = part['m']; off = float(el.offset)
@@ -2300,14 +1840,14 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
             if (cont_prev and lc['pset'] != prev['pset']
                     and (nxt is None or lc['pset'] != nxt['pset'])
                     and len(prev['pitches']) == 3):
-                _reharmonize(lc['parts'], prev['pitches'])       # backward absorb
+                _reharmonize(lc['parts'], prev['pitches'])
                 prev['e'] = lc['e']; prev['beats'] = prev['e'] - prev['s']
                 prev['parts'].extend(lc['parts'])
                 absorbed += 1
                 continue
             if ((not cont_prev) and cont_next and lc['pset'] != nxt['pset']
                     and len(nxt['pitches']) == 3):
-                _reharmonize(lc['parts'], nxt['pitches'])        # forward absorb
+                _reharmonize(lc['parts'], nxt['pitches'])
                 nxt['s'] = lc['s']; nxt['beats'] = nxt['e'] - nxt['s']
                 nxt['parts'] = lc['parts'] + nxt['parts']
                 absorbed += 1
@@ -2315,17 +1855,12 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         res.append(lc)
     logicals = res
 
-    # A chord is "kin" if it matches a neighboring chord, even across a rest. A
-    # one-beat kin chord belongs to the passage around it, so it gets that
-    # section's texture instead of sticking out as a lone block.
     for k, lc in enumerate(logicals):
         p = logicals[k - 1] if k > 0 else None
         n = logicals[k + 1] if k + 1 < len(logicals) else None
         lc['kin'] = ((p is not None and lc['pset'] == p['pset']) or
                      (n is not None and lc['pset'] == n['pset']))
 
-    # One texture per section (a run of chords in the same tier). Without a
-    # seed it's always the first entry in the tier's menu.
     i = 0
     while i < len(logicals):
         j = i
@@ -2339,9 +1874,6 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         i = j + 1
 
     def decide(beats, tier, ntones, choice, kin=False):
-        """Pick the texture for one chord. Anything that isn't a full triad
-        stays a block, and so does a lone one-beat chord in a busy section,
-        since it's too short to carry a figure."""
         if ntones != 3: return "block"
         if tier == "calm": return choice
         if tier == "medium": return choice
@@ -2349,9 +1881,6 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         return choice
 
     def place_note(plist, abs_off, ql):
-        """Insert one note or chord of a texture, splitting it at barlines and
-        tying the pieces. A note that ran past the barline would overfill the
-        measure, which MuseScore shows as a broken measure with grey rests."""
         cursor, remaining, segs = abs_off, ql, []
         while remaining > 1e-9:
             meas, mstart = measure_for(cursor)
@@ -2400,8 +1929,8 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         if pat == "block":
             if round(lc['beats']) == 1: one_beat_blocks += 1
             continue
-        if pat in BLOCK_VARIANTS:                 # revoice in place, keeping the
-            vp = acc_block_pitches(pat, r, t, f)  # rhythm, durations, and ties
+        if pat in BLOCK_VARIANTS:
+            vp = acc_block_pitches(pat, r, t, f)
             for part in lc['parts']:
                 el = part['el']; meas = part['m']; off = float(el.offset)
                 nc = m21.chord.Chord([copy.deepcopy(p) for p in vp])
@@ -2412,7 +1941,6 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         for part in lc['parts']: part['m'].remove(part['el'])
         for rel, ql, plist in acc_build(pat, lc['beats'], r, t, f):
             place_note(plist, lc['s'] + rel, ql)
-
     def pset(e): return None if (e is None or e.isRest) else frozenset(p.midi for p in (e.pitches if e.isChord else [e.pitch]))
     els = list(lh.flatten().notesAndRests)
     for i, el in enumerate(els):
@@ -2475,22 +2003,13 @@ def run_accompaniment_variation(xml_in, xml_out, drums_wav, rng=None):
         print(f"   !! {pn} measure {mn}: {why}")
 
 
-# ============================================================================
-# TITLE AND COMPOSER
-# ============================================================================
+# title and composer
 def set_score_info(xml_path, title=None, composer=None):
-    """Write the title and composer into a finished score.
-
-    music21 leaves its own defaults in the header ("Music21 Fragment" and
-    "Music21"), and that is what MuseScore prints at the top of the page. Only
-    those two fields are rewritten, so no note is touched. A blank composer
-    drops the line instead of printing a name.
-    """
     import re
     from xml.sax.saxutils import escape
     with open(xml_path, encoding="utf-8") as fh:
         xml = fh.read()
-    cut = xml.find("<part-list")            # only the header above the music
+    cut = xml.find("<part-list")
     head, body = (xml[:cut], xml[cut:]) if cut > 0 else (xml, "")
 
     title = (title or "").strip()
@@ -2515,17 +2034,11 @@ def set_score_info(xml_path, title=None, composer=None):
     return xml_path
 
 
-# ============================================================================
-# ORCHESTRATOR
-# ============================================================================
+# run all stages
 def migrate_old_filenames(out_dir, song):
-    """Rename outputs from the old naming scheme (no digit prefix) so
-    their caches still get reused. Only renames when the new name is
-    free, moves .ver files along with their scores, and does nothing on a
-    folder that's already done."""
     if not os.path.isdir(out_dir): return
     def new_name(f):
-        if not f.startswith(song): return None       # already numbered, or not ours
+        if not f.startswith(song): return None
         if f.endswith("_beats.npz"):      return "2" + f
         if f.endswith("_crepe.npz"):      return "3" + f
         for pat in ("_vocals.mid", "_vocals_extended.mid", "_vocals_patched.mid", "_vocals_filled.mid"):
@@ -2537,7 +2050,7 @@ def migrate_old_filenames(out_dir, song):
         if "_base" in f and (f.endswith(".musicxml") or f.endswith(".musicxml.ver")):
             return "7" + f
         if "_silenced" in f and f.endswith(".musicxml"): return "8" + f
-        if f.endswith(".musicxml"):       return "FINAL_" + f    # the final score
+        if f.endswith(".musicxml"):       return "FINAL_" + f
         return None
     moved = 0
     for f in sorted(os.listdir(out_dir)):
@@ -2553,20 +2066,10 @@ def migrate_old_filenames(out_dir, song):
 
 
 def run_pipeline(input_audio, force=False, seed=None, title=None, composer=None):
-    """Run every stage in order and return the path of the finished score.
-
-    Each stage writes one file and is skipped if that file already exists.
-    Rebuilding a stage rebuilds everything after it, so no stage reads a stale
-    input. force=True (or FORCE_REBUILD) also throws away the CREPE and beat
-    caches and rebuilds every stage from the stems. The title and composer are
-    written into the finished file at the end; the title defaults to the song
-    name and the composer is left off when it's blank."""
     print("=" * 72)
     print(f"UNIFIED PIANO TRANSCRIPTION PIPELINE   ({os.path.basename(input_audio)})"
           + (f"   [seed {seed}]" if seed is not None else ""))
     print("=" * 72)
-    # Separate random generators for stages 9 and 11, both made from the seed,
-    # so a seed gives the same sheet no matter which stages were cached.
     rng_gs  = np.random.default_rng([int(seed), 0]) if seed is not None else None
     rng_acc = np.random.default_rng([int(seed), 1]) if seed is not None else None
     tag = f"_seed{seed}" if seed is not None else ""
@@ -2585,46 +2088,39 @@ def run_pipeline(input_audio, force=False, seed=None, title=None, composer=None)
     other_wav  = os.path.join(stem_dir, "other.wav")
     accomp_wav = os.path.join(stem_dir, "accompaniment.wav")
 
-    # The leading digit keeps the folder sorted in build order (it's the build
-    # step, not the stage number). The melody files all start with 4 because
-    # it's one file passed along stages 4-7. FINAL_ sorts after every digit.
     beats_npz      = P(f"2{song}_beats.npz")
     crepe_npz      = P(f"3{song}_crepe.npz")
     vocals_mid     = P(f"4{song}_vocals.mid")
     vocals_ext_mid = P(f"4{song}_vocals_extended.mid")
     vocals_fill_mid = P(f"4{song}_vocals_filled.mid")
     vocals_patch_mid = P(f"4{song}_vocals_patched.mid")
-    bp_cache       = P(f"5{song}_basicpitch.npz")          # Basic Pitch cache, other.wav
-    bp_vocals_cache = P(f"5{song}_basicpitch_vocals.npz")  # Basic Pitch cache, vocals.wav
-    other_dp_mid   = P(f"5{song}_other_dp.mid")            # instrumental line, to listen to
+    bp_cache       = P(f"5{song}_basicpitch.npz")
+    bp_vocals_cache = P(f"5{song}_basicpitch_vocals.npz")
+    other_dp_mid   = P(f"5{song}_other_dp.mid")
     chords_mid     = P(f"6{song}_chords.mid")
     chords_txt     = P(f"6{song}_chords.txt")
     base_xml       = P(f"7{song}_base{tag}.musicxml")
     silenced_xml   = P(f"8{song}_silenced{tag}.musicxml")
     final_xml      = P(f"FINAL_{song}{tag}.musicxml")
-
     def have(*paths): return all(os.path.exists(p) for p in paths)
 
-    def beats_current(p):   # the cached grid must carry the current repair version
+    def beats_current(p):
         try:
             c = np.load(p, allow_pickle=True)
             return "repair" in c.files and int(c["repair"]) == BEAT_REPAIR_VERSION
         except Exception:
             return False
 
-    def gs_current(p):   # the base XML must carry the current assembly version
+    def gs_current(p):
         try:
             first = open(p + ".ver").readline()
             return "".join(ch for ch in first if ch.isdigit()) == str(GS_VERSION)
         except OSError: return False
 
-    if force:   # a full rebuild must also discard the pitch and beat caches
+    if force:
         for f in (crepe_npz, beats_npz):
             if os.path.exists(f): os.remove(f)
 
-    # Rebuild flags. A rebuilt stage forces every stage after it. Vocal
-    # recovery (stage 5) runs before the extension stage, since extension
-    # closes the gaps stage 5 needs to see.
     do_voc  = force or not have(vocals_mid)
     def mel_current(p):
         try:
@@ -2637,16 +2133,12 @@ def run_pipeline(input_audio, force=False, seed=None, title=None, composer=None)
     do_fill = ENABLE_REST_FILL and (do_ext or not have(vocals_fill_mid))
     melody_mid = vocals_fill_mid if ENABLE_REST_FILL else vocals_ext_mid
     up_mel  = do_fill if ENABLE_REST_FILL else do_ext
-    # A grid cached before the current repair version is stale, so the
-    # chords and score built on it rebuild too. This check lives here and
-    # not in stage 2, because stage 2 only runs when something else
-    # already needs rebuilding.
     grid_stale = have(beats_npz) and not beats_current(beats_npz)
     do_chd  = force or not have(chords_mid) or grid_stale
     do_base = up_mel or do_chd or not have(base_xml) or not gs_current(base_xml)
     do_sil  = do_base or not have(silenced_xml)
     do_var  = do_sil or not have(final_xml)
-    need_tempo = do_voc or do_chd or do_base              # the score grid is anchored on beats
+    need_tempo = do_voc or do_chd or do_base
     if grid_stale:
         print("\n   (cached beat grid predates the current repair -> "
               "chords and score will rebuild)")
@@ -2664,7 +2156,6 @@ def run_pipeline(input_audio, force=False, seed=None, title=None, composer=None)
     if need_tempo:
         tempo, beat_times, grid_changed = detect_tempo_and_beats(accomp_wav, beats_npz)
         if grid_changed:
-            # Chords and the score were built on the old grid, so rebuild both.
             print("   the grid moved -> chords and score will be rebuilt on it")
             do_chd = do_base = do_sil = do_var = True
     else:
@@ -2744,9 +2235,6 @@ def run_pipeline(input_audio, force=False, seed=None, title=None, composer=None)
 
 
 def prompt_for_audio():
-    """Ask which file to transcribe: a file name (looked up in data/input/) or
-    a full path. If the audio is gone but its stems are still there, that works
-    too and separation is skipped."""
     d = os.path.join("data", "input")
     while True:
         name = input("\nAudio file to transcribe (e.g. song.mp3): ").strip().strip('"').strip("'")
@@ -2769,8 +2257,6 @@ def prompt_for_audio():
 
 
 def song_has_cached_products(audio):
-    """True if this song already has stems or outputs, so asking about a
-    full rebuild makes sense."""
     song = os.path.splitext(os.path.basename(audio))[0]
     out_dir = os.path.join(OUT_ROOT, song)
     if os.path.isdir(out_dir) and any(not f.startswith('.') for f in os.listdir(out_dir)):

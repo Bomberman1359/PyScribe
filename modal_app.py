@@ -1,15 +1,4 @@
-# modal_app.py -- the PyScribe web app, hosted on Modal
-#
-# app.py is the version you run on your own computer. This file puts the same
-# page online. The page runs in a small CPU container, and each song is sent to
-# its own GPU container. Modal cuts off any web request after 150 seconds, and
-# a song takes longer than that, so instead of waiting on one long request the
-# page checks on the song every few seconds.
-#
-# Everything here shuts off when nobody is using it, and the daily song limit
-# keeps one busy day from using up the month's free credits.
-#
-# Deploy from this folder:  modal deploy modal_app.py
+# modal app code
 
 import os
 import json
@@ -19,20 +8,18 @@ import hashlib
 import modal
 
 HERE        = os.path.dirname(os.path.abspath(__file__))
-APP_DIR     = "/root/pyscribe"       # where the code sits inside the containers
+APP_DIR     = "/root/pyscribe"
 GITHUB_URL  = "https://github.com/Bomberman1359/PyScribe"
-MAX_MINUTES = 6       # longer songs get turned away
-MAX_WAITING = 3       # songs allowed in line before new ones get turned away
-MAX_PER_DAY = 12      # songs started per day (UTC); each one uses about 7 cents of credits
-CHECK_EVERY = 5       # seconds between checks on a running song
-GIVE_UP_MIN = 25      # the page stops waiting on a song after this many minutes
+MAX_MINUTES = 6
+MAX_WAITING = 3
+MAX_PER_DAY = 12
+CHECK_EVERY = 5
+GIVE_UP_MIN = 25
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("ffmpeg", "libsndfile1", "git", "build-essential")
     .pip_install_from_requirements(os.path.join(HERE, "requirements.txt"))
-    # Demucs downloads its model the first time it runs. Doing that here puts
-    # the model in the image, so no song has to wait for the download.
     .run_commands("python -c \"from demucs.pretrained import get_model; get_model('htdemucs')\"")
     .add_local_file(os.path.join(HERE, "pipeline.py"), f"{APP_DIR}/pipeline.py")
     .add_local_file(os.path.join(HERE, "examples", "lift_me_up.mp3"),
@@ -41,18 +28,10 @@ image = (
 
 app = modal.App("pyscribe", image=image)
 
-# Small shared notes between the containers: the stage each running song is on
-# ("[3-4/11] Vocal transcription") and how many songs were started today.
 progress = modal.Dict.from_name("pyscribe-progress", create_if_missing=True)
 
 
-# ============================================================================
-# GPU side: one song, start to finish
-# ============================================================================
 class _StageLog:
-    """Takes the place of stdout while the pipeline runs. Keeps the whole
-    printout for the log box and hands each stage header to `report`."""
-
     def __init__(self, report):
         self.report, self.parts, self.line = report, [], ""
 
@@ -73,8 +52,6 @@ class _StageLog:
 
 
 def run_job(filename, audio, seed, title, composer, workdir, report=lambda line: None):
-    """Save the upload as workdir/data/input/<filename> and run the pipeline.
-    Returns {"xml": bytes or None, "name": file name, "log": the printout}."""
     import sys
     import contextlib
     import traceback
@@ -84,7 +61,7 @@ def run_job(filename, audio, seed, title, composer, workdir, report=lambda line:
         sys.path.insert(0, workdir)
     path = os.path.join("data", "input", filename)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if not os.path.exists(path):          # the name has the file's hash in it
+    if not os.path.exists(path):
         with open(path, "wb") as f:
             f.write(audio)
 
@@ -106,11 +83,9 @@ def _report(job_id, line):
     try:
         progress[job_id] = line
     except Exception:
-        pass    # the stage display is extra; the song keeps going without it
+        pass
 
 
-# One GPU container at most, no retries, a hard stop after 20 minutes, and it
-# shuts off 30 seconds after the last song.
 @app.function(gpu="T4", cpu=2.0, memory=8192, timeout=20 * 60,
               max_containers=1, scaledown_window=30)
 def transcribe_song(filename: str, audio: bytes, seed, title: str, composer: str,
@@ -119,16 +94,11 @@ def transcribe_song(filename: str, audio: bytes, seed, title: str, composer: str
                    report=lambda line: _report(job_id, line))
 
 
-# ============================================================================
-# Web side: the page
-# ============================================================================
 def _today():
     return "songs " + time.strftime("%Y-%m-%d", time.gmtime())
 
 
 class ModalJobs:
-    """Hands songs to transcribe_song and checks on them."""
-
     def full_today(self):
         try:
             return progress.get(_today(), 0) >= MAX_PER_DAY
@@ -150,7 +120,6 @@ class ModalJobs:
         return call.object_id
 
     def check(self, call_id, job_id):
-        """("running", stage or None) while the song is going, ("done", result) after."""
         try:
             return "done", modal.FunctionCall.from_id(call_id).get(timeout=0)
         except modal.exception.OutputExpiredError:
@@ -173,7 +142,6 @@ class ModalJobs:
 
 
 def _parse_seed(seed_text):
-    """blank = default sheet, "r" = random, anything else has to be a number"""
     import gradio as gr
     import numpy as np
     s = (seed_text or "").strip().lower()
@@ -188,14 +156,13 @@ def _parse_seed(seed_text):
 
 
 def _check_length(path):
-    """Turn away songs longer than MAX_MINUTES without loading the whole file."""
     import gradio as gr
     import soundfile as sf
     try:
         info = sf.info(path)
         minutes = info.frames / info.samplerate / 60.0
     except Exception:
-        return  # soundfile can't read this format; Demucs still can
+        return
     if minutes > MAX_MINUTES:
         raise gr.Error(
             f"That file is {minutes:.1f} minutes long. This site takes songs up to "
@@ -220,10 +187,8 @@ def build_ui(jobs):
         try:
             with open(audio_file, "rb") as f:
                 audio = f.read()
-        except OSError:      # the page's server restarted since the upload
+        except OSError:
             raise gr.Error("That upload is no longer on the server. Upload the file again.")
-        # Same naming as app.py: the file's hash keeps two different "song.mp3"
-        # uploads apart, since the pipeline caches everything by song name.
         stem, ext = os.path.splitext(os.path.basename(audio_file))
         stem = "".join(c for c in stem if c not in '\\/:*?"<>|').strip() or "song"
         filename = f"{stem}_{hashlib.sha1(audio).hexdigest()[:8]}{ext or '.mp3'}"
@@ -286,9 +251,6 @@ def build_ui(jobs):
             The code is on [GitHub]({GITHUB_URL}).
             """
         )
-        # The running song's ticket is kept in the page itself (a hidden box), not
-        # on the server. That way the page's server holds nothing between clicks
-        # and can shut off as soon as nobody is using it.
         job = gr.Textbox(visible=False)
         timer = gr.Timer(CHECK_EVERY, active=False)
         with gr.Row():
@@ -328,8 +290,6 @@ def make_web_app(jobs, workdir):
                                allowed_paths=[os.path.join(workdir, "output")])
 
 
-# Gradio needs every visitor on the same container, hence max_containers=1.
-# It's a quarter of a CPU core, and it shuts off 5 minutes after the last click.
 @app.function(cpu=0.25, memory=512, max_containers=1, scaledown_window=300)
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app()

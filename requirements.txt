@@ -16,5 +16,5 @@ basic-pitch==0.4.0
 # so it's installed from GitHub instead.
 madmom @ git+https://github.com/CPJKU/madmom@27f032e8947204902c675e5e341a3faf5dc86dae
 
-# web demo (app.py)
+# web app
 gradio==6.28.0
