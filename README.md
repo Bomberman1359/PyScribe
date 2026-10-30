@@ -4,7 +4,7 @@
 
 PyScribe turns a song into piano sheet music you can actually play. You give it an mp3 or wav, and it gives back a two-hand piano arrangement as a MusicXML file that opens in MuseScore.
 
-**Web app:** [chunhweechoi--pyscribe-web.modal.run](https://chunhweechoi--pyscribe-web.modal.run) if you want to try it without installing anything. A 3-minute song takes 3 to 4 minutes. It runs on free GPU credits, so it's limited to 12 songs a day, each up to 6 minutes long.  
+**Web app:** [chunhweechoi--pyscribe-web.modal.run](https://chunhweechoi--pyscribe-web.modal.run) if you want to try it without installing anything. A 3-minute song takes 3 to 4 minutes. It runs on free GPU credits, so it's limited to 12 songs a day, each up to 6 minutes long.
 
 ![First page of the Lift Me Up transcription in MuseScore](examples/lift_me_up_page1.png)
 
@@ -34,18 +34,23 @@ Without a seed you get the same sheet every time, as long as the stems are cache
 
 ## Design decisions
 
-- **Fix problems on the page when possible.** Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the written notes, so one rule catches the same mistake no matter where it came from. 
-- **Let the recording decide.** Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
-- **No tuning for one song.** Every rule had to work across different songs, not just Lift Me Up.
-- **A rough fill is better than an empty bar.** If there's a melody in a vocal rest, it goes on the page even if it isn't perfect.
+I fix mistakes on the written notes when I can. Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the page, so one rule catches the same mistake no matter where it came from.
+
+The recording decides as much as possible. Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
+
+Nothing is tuned for one song. Every rule had to work across different songs, not just Lift Me Up.
+
+A rough fill is better than an empty bar. If there's a melody in a vocal rest, it goes on the page even if it isn't perfect.
 
 ## What didn't work
 
-- **Using the beat grid to clean up vibrato.** Vibrato shows up as extra short notes, so I tried a rule where a pitch change only counted as a new note if it landed close to a beat. Set tight, it deleted real notes. Loosened, it barely did anything, because sixteenth-note subdivisions sit so close together that almost any wobble lands near one. 
-- **Telling vibrato apart from real ornaments.** After the grid I tried two more rules for the same problem, and they all failed the same way: a vibrato wobble and a real ornament both go up a step and come back, so any rule that deletes one deletes the other. Some vibrato still slips through as short notes, and fixing that would take a trained model.
-- **Stale caches.** Old cached files kept getting reused after I changed the logic, so a fix wouldn't show up and I couldn't tell why. Now the cached score, melody, and beat grid each carry a version number, and a mismatch forces a rebuild.
-- **Finding missed beats one gap at a time.** madmom missed 19 beats on Lift Me Up, mostly in quiet parts, so the score came out 5 measures short (111 instead of 116). My first fix checked the space between every pair of beats, and if one space was about twice as long as the ones next to it, it added a beat in the middle. But the missed beats were bunched together, so the spaces next to them were stretched too and nothing stood out. It only caught 4 of the 19. What worked was finding the one steady tempo that fits the whole song and redrawing every beat from that.
-- **Pulling the melody out of a loud mix.** Melodia and Basic Pitch both lost the lead when it wasn't louder than the backing. On Lift Me Up the pitch confidence stayed near zero and the line slid down to the bass. So the instrumental line only fills vocal rests, and notes below C3 are kept out of it.
+Vibrato shows up as extra short notes, so I tried using the beat grid to clean it up: a pitch change only counted as a new note if it landed close to a beat. Set tight, it deleted real notes. Loosened, it barely did anything.
+
+After the grid I tried two more rules to tell vibrato apart from real ornaments, and they all failed the same way. A vibrato wobble and a real ornament both go up a step and come back, so any rule that deletes one deletes the other. Some vibrato still slips through as short notes.
+
+Old cached files kept getting reused after I changed the logic, so a fix wouldn't show up and I couldn't tell why. Now the cached score, melody, and beat grid each carry a version number, and a mismatch forces a rebuild.
+
+Melodia and Basic Pitch both lost the lead melody whenever it wasn't louder than the backing. On Lift Me Up the pitch confidence stayed near zero and the line slid down to the bass. So the instrumental line only fills vocal rests, and notes below C3 are kept out of it.
 
 ## Install
 
@@ -86,12 +91,6 @@ final_xml = run_pipeline("data/input/song.mp3", seed=None, force=False,
                         title="My Song", composer="Me")
 ```
 
-To run the web demo on your own computer:
-
-```bash
-python app.py        # then open http://127.0.0.1:7860
-```
-
 Demucs and CREPE are the slow stages. Both get cached, so a rerun of the same song is quick. Both also use an NVIDIA GPU when there is one. Lift Me Up takes about 30 minutes on my laptop's CPU and 3 to 4 minutes on a T4.
 
 The web app runs on [Modal](https://modal.com) from `modal_app.py`. A small CPU container serves the page, and songs run one at a time in a T4 container that shuts off when nothing is waiting. To host your own copy:
@@ -108,11 +107,11 @@ modal deploy modal_app.py
 python test_passes.py
 ```
 
-34 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed.
+34 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed. GitHub runs them on every push.
 
 ## Limits
 
-- The melody comes from the vocals, so songs without singing don't work well yet. A separate path for instrumental songs is planned.
+- The melody comes from the vocals, so songs without singing don't work well yet. I'm planning a separate path for instrumental songs.
 - Everything is written in 4/4, and chords are major or minor triads.
 - Some vibrato still shows up as short notes.
 
