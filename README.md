@@ -8,7 +8,7 @@ PyScribe turns a song into piano sheet music you can actually play. You give it 
 
 ![First page of the Lift Me Up transcription in MuseScore](examples/lift_me_up_page1.png)
 
-*First page of the sheet PyScribe made for "Lift Me Up", a song I wrote. Nothing was fixed by hand. The full score is in [`examples/`](examples) and was made with seed 2.*
+*First page of the sheet PyScribe made for "Lift Me Up", a song I wrote. The full score is in [`examples/`](examples) and was made with seed 2.*
 
 ## How it works
 
@@ -30,7 +30,7 @@ The melody comes from the vocal stem, the chords come from the bass and backing 
 
 Every stage saves its output in `output/<song>/`, so a rerun only redoes what changed. Cached files carry a version number (`GS_VERSION`, `MEL_VERSION`, `BEAT_REPAIR_VERSION`), and a mismatch forces a rebuild.
 
-Without a seed you get the same sheet every time, as long as the stems are cached. Separating the song again changes some notes, because Demucs shifts the audio by a random amount on every run. Two fresh runs of Lift Me Up matched on 485 of 534 melody notes and 545 of 572 left-hand notes. A seed nudges the melody timing and picks different left-hand textures, so you can make a few versions and keep the one you like.
+Without a seed you get the same sheet every time, as long as the stems are cached. Separating the song again changes some notes, because Demucs shifts the audio by a random amount on every run. A seed nudges the melody timing and picks different left-hand textures, so you can make a few versions and keep the one you like.
 
 ## Design decisions
 
@@ -46,7 +46,7 @@ A rough fill is better than an empty bar. If there's a melody in a vocal rest, i
 
 Vibrato shows up as extra short notes, so I tried using the beat grid to clean it up: a pitch change only counted as a new note if it landed close to a beat. Set tight, it deleted real notes. Loosened, it barely did anything.
 
-After the grid I tried two more rules to tell vibrato apart from real ornaments, and they all failed the same way. A vibrato wobble and a real ornament both go up a step and come back, so any rule that deletes one deletes the other. Some vibrato still slips through as short notes.
+After the grid I tried two more rules to tell vibrato apart from real ornaments, and they all failed the same way. A vibrato wobble and a real ornament both go up a step and come back, so any rule that deletes one deleted the other. 
 
 Old cached files kept getting reused after I changed the logic, so a fix wouldn't show up and I couldn't tell why. Now the cached score, melody, and beat grid each carry a version number, and a mismatch forces a rebuild.
 
@@ -65,7 +65,6 @@ pip install -r requirements.txt
 mkdir -p data/input
 ```
 
-madmom is installed from GitHub on purpose. The PyPI release (0.16.1) doesn't build with current versions of pip.
 
 ## Usage
 
@@ -107,7 +106,7 @@ modal deploy modal_app.py
 python test_passes.py
 ```
 
-34 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this, like sixteenth-note bursts that stopped merging after a fix for repeated syllables, or stage 5 filling an instrumental intro with vocal bleed. GitHub runs them on every push.
+34 checks that run in about a second and only need numpy. They cover same-pitch merging, quantization, bar decluttering, register repair, vocal gap handling, the beat grid repair, and the title and composer written into the finished file. Each one pins down a bug I ran into while building this. GitHub runs them on every push.
 
 ## Limits
 
