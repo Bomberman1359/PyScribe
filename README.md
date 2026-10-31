@@ -34,7 +34,7 @@ Without a seed you get the same sheet every time, as long as the stems are cache
 
 ## Design decisions
 
-I fix mistakes on the written notes when I can. Rules like merging split notes, collapsing vibrato trills, and lifting low runs work on the page, so one rule catches the same mistake no matter where it came from.
+The current pipeline uses pretrained models for separation and pitch estimation, followed by rules that clean up their output.
 
 The recording decides as much as possible. Left-hand rests come from stem energy, the texture comes from drum onsets, and stage 5 checks the vocal stem's level before it changes anything.
 
