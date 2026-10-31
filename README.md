@@ -112,7 +112,6 @@ python test_passes.py
 
 - The melody comes from the vocals, so songs without singing don't work well yet. I'm planning a separate path for instrumental songs.
 - Everything is written in 4/4, and chords are major or minor triads.
-- Some vibrato still shows up as short notes.
 
 ## Copyright
 
