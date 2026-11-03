@@ -5,12 +5,10 @@ venv/
 .venv/
 piano_env/
 
-# macOS and editors
 .DS_Store
 .vscode/
 .gradio/
 
-# Songs, stems, and pipeline output. Never commit copyrighted audio.
 data/
 separated/
 output/
@@ -23,5 +21,4 @@ output/
 *.mid
 *.ver
 
-# The one exception: Lift Me Up, my own song, used as the example
 !examples/lift_me_up.mp3
